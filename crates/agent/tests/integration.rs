@@ -1360,3 +1360,94 @@ async fn test_auto_run_worker_single_live() {
     // Silence unused-import warnings when this is the only test compiled.
     let _ = (LlmPolicy::default(),);
 }
+
+/// Live orchestrator call. Verifies the forced-tool-use path end-to-end:
+///   - HTTP body construction with forced tool_choice
+///   - Anthropic (or OpenAI) response parsing
+///   - submit_plan tool input → Plan struct via parse_plan_from_tool_input
+///   - resulting plan picks models from the supplied pool only
+///   - resulting plan has at least one worker with non-empty prompt
+#[tokio::test]
+#[ignore = "requires ANTHROPIC_API_KEY (orchestrator currently defaults to Claude Sonnet 4.6)"]
+async fn test_auto_orchestrator_generates_parseable_plan_live() {
+    use agent::auto::{generate_plan, OrchestratorRequest, WorkerPoolEntry};
+    use agent::llm::{LlmClientConfig, Provider};
+    use agent::llm::client::LlmPolicy;
+
+    let _ = env_logger::try_init();
+    let api_key = api_key();
+
+    let pool = vec![
+        WorkerPoolEntry {
+            provider_id: "anthropic".into(),
+            model: "claude-haiku-4-5".into(),
+            description: "fast + cheap; best for file reads, grep, simple verification".into(),
+        },
+        WorkerPoolEntry {
+            provider_id: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            description: "strong reasoning + coding; best for design, multi-file edits, synthesis".into(),
+        },
+    ];
+
+    let req = OrchestratorRequest {
+        task: "Read the file README.md in the working directory and produce a one-paragraph \
+               summary of what the project does, then list any TODO comments you find anywhere \
+               under src/.",
+        worker_pool: &pool,
+        prior_results: &[],
+        replan_reason: None,
+        plan_version: 1,
+    };
+
+    let orchestrator_llm = LlmClientConfig {
+        provider: Provider::Anthropic,
+        base_url: "https://api.anthropic.com".into(),
+        model: "claude-sonnet-4-6".into(),
+        api_key,
+        temperature: Some(0.0),
+        max_completion_tokens: Some(4096),
+        extra_headers: vec![],
+        thinking: None,
+        disable_cache_control: true,
+        policy: LlmPolicy::default(),
+    };
+
+    let plan = generate_plan(&orchestrator_llm, &req, None)
+        .await
+        .expect("orchestrator should produce a parseable plan");
+
+    eprintln!("[live] plan v{}: {}", plan.version, plan.reasoning);
+    for w in &plan.workers {
+        eprintln!(
+            "[live]   {} ({}): see_prior={:?}, prompt={:?}",
+            w.id,
+            w.model,
+            w.see_prior,
+            &w.prompt[..w.prompt.len().min(80)]
+        );
+    }
+
+    assert_eq!(plan.version, 1);
+    assert!(!plan.reasoning.is_empty(), "reasoning must be non-empty");
+    assert!(!plan.workers.is_empty(), "plan must contain at least one worker");
+    assert!(
+        plan.workers.len() <= 10,
+        "plan exceeded the system-prompt's 10-worker hard cap: {} workers",
+        plan.workers.len()
+    );
+
+    let pool_models: std::collections::HashSet<&str> =
+        pool.iter().map(|e| e.model.as_str()).collect();
+    for w in &plan.workers {
+        assert!(
+            pool_models.contains(w.model.as_str()),
+            "worker {} picked model `{}` not in pool {:?}",
+            w.id,
+            w.model,
+            pool_models
+        );
+        assert!(!w.prompt.is_empty(), "worker {} has empty prompt", w.id);
+        assert!(w.id.starts_with('w'), "worker id should be wN, got `{}`", w.id);
+    }
+}
