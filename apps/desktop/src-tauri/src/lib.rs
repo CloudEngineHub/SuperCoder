@@ -689,14 +689,29 @@ pub fn run() {
                     let wm = wm.inner().clone();
                     tauri::async_runtime::block_on(async move { wm.stop_all().await });
                 }
-                // App-managed stack: stop containers (keep volumes).
+                // App-managed stack: stop containers (keep volumes). Bounded
+                // to 5s so a wedged Docker daemon can't keep the app
+                // un-quittable — `block_on` here would otherwise pin the event
+                // loop until docker responded. 5s comfortably covers
+                // `docker compose stop -t 3`; past that we abandon and exit.
                 if let Some(ctl) =
                     app_handle.try_state::<Arc<engine_control::EngineController>>()
                 {
                     if ctl.mode() == engine_control::EngineMode::App {
                         let ctl = ctl.inner().clone();
                         tauri::async_runtime::block_on(async move {
-                            let _ = ctl.stop().await;
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                ctl.stop(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => log::warn!("[engine] quit stop failed: {e}"),
+                                Err(_) => log::warn!(
+                                    "[engine] quit stop timed out after 5s; abandoning"
+                                ),
+                            }
                         });
                     }
                 }
