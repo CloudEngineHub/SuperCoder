@@ -10,11 +10,16 @@
 //!   P2: `orchestrator.rs` — orchestrator LLM call + plan parsing (forced tool use).
 //!   P3: `executor.rs` — sequencer + reactive replan loop.
 
+pub mod executor;
 pub mod orchestrator;
 pub mod schema;
 pub mod types;
 pub mod worker;
 
+pub use executor::{
+    run as run_auto, AutoApprove, ExecutorConfig, LiveWorkerRunner, LlmPlanGenerator,
+    PlanApprover, PlanGenerator, WorkerRunner,
+};
 pub use orchestrator::{
     build_orchestrator_messages, generate_plan, parse_plan_from_tool_input, OrchestratorError,
     OrchestratorRequest,

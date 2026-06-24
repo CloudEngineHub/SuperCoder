@@ -1451,3 +1451,176 @@ async fn test_auto_orchestrator_generates_parseable_plan_live() {
         assert!(w.id.starts_with('w'), "worker id should be wN, got `{}`", w.id);
     }
 }
+
+/// Full end-to-end Auto mode against a real LLM stack: real orchestrator,
+/// real `LiveWorkerRunner`, real `LlmPlanGenerator`, sequenced by
+/// `executor::run`. This is the test that P3's mocked unit tests cannot
+/// replace — it proves the components compose correctly under real cancel
+/// tokens, async boundaries, and channel back-pressure.
+///
+/// Task is intentionally small (create a file with specific contents) so the
+/// orchestrator likely emits a single-worker plan, keeping the test fast and
+/// cheap (~$0.02–0.05 per run on Sonnet 4.6).
+#[tokio::test]
+#[ignore = "requires ANTHROPIC_API_KEY (Auto orchestrator + workers both Anthropic)"]
+async fn test_auto_executor_end_to_end_live() {
+    use agent::auto::{
+        run_auto, AutoApprove, AutoResult, AutoStatus, ExecutorConfig, LiveWorkerRunner,
+        LlmPlanGenerator, WorkerContext, WorkerPoolEntry,
+    };
+    use agent::llm::client::LlmPolicy;
+    use agent::llm::{LlmClientConfig, Provider};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    let _ = env_logger::try_init();
+    let tmp = tempdir().unwrap();
+    let working_dir = tmp.path().to_path_buf();
+    let api_key = api_key();
+
+    // Worker pool: two real Anthropic models. Description tells the
+    // orchestrator how to pick.
+    let pool = vec![
+        WorkerPoolEntry {
+            provider_id: "anthropic".into(),
+            model: "claude-haiku-4-5".into(),
+            description: "fast + cheap; best for simple file ops, reads, single-shot writes".into(),
+        },
+        WorkerPoolEntry {
+            provider_id: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            description: "stronger reasoning + multi-step coding; best for design and complex edits".into(),
+        },
+    ];
+
+    let orchestrator_llm = LlmClientConfig {
+        provider: Provider::Anthropic,
+        base_url: "https://api.anthropic.com".into(),
+        model: "claude-sonnet-4-6".into(),
+        api_key: api_key.clone(),
+        temperature: Some(0.0),
+        max_completion_tokens: Some(4096),
+        extra_headers: vec![],
+        thinking: None,
+        disable_cache_control: true,
+        policy: LlmPolicy::default(),
+    };
+
+    // Worker LLM template — model is overridden per worker by run_worker.
+    let worker_llm_base = LlmClientConfig {
+        provider: Provider::Anthropic,
+        base_url: "https://api.anthropic.com".into(),
+        model: "placeholder".into(),
+        api_key: api_key.clone(),
+        temperature: Some(0.0),
+        max_completion_tokens: Some(2048),
+        extra_headers: vec![],
+        thinking: None,
+        disable_cache_control: true,
+        policy: LlmPolicy::default(),
+    };
+
+    let cancel = CancellationToken::new();
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
+
+    let auto_run_id = "auto-run-e2e".to_string();
+    let session_id = "sess-e2e".to_string();
+
+    let worker_ctx = WorkerContext {
+        session_id: session_id.clone(),
+        run_id: auto_run_id.clone(),
+        working_dir: working_dir.clone(),
+        event_tx: event_tx.clone(),
+        cancel_token: cancel.clone(),
+        llm_base_config: worker_llm_base,
+        retry_config: RetryConfig::default(),
+        compaction_config: Default::default(),
+        compaction_llm: None,
+        max_iterations: 20,
+        context_engine: None,
+        context_engine_repo_path: None,
+        persister: None,
+        approval_handler: None,
+        checkpoint_dir: None,
+    };
+
+    let plan_gen = Arc::new(LlmPlanGenerator { llm: orchestrator_llm });
+    let runner = Arc::new(LiveWorkerRunner { ctx: worker_ctx });
+    let approver = Arc::new(AutoApprove);
+
+    let config = ExecutorConfig {
+        task: "Create a file named `result.txt` in the working directory whose \
+               sole contents are the exact string `hello from auto mode` followed \
+               by a single trailing newline. Do not create any other files."
+            .into(),
+        auto_run_id: auto_run_id.clone(),
+        session_id: session_id.clone(),
+        worker_pool: pool,
+        replan_budget: 1,
+    };
+
+    // Collect events on a side task so they don't fill the channel buffer.
+    let collected_events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+    let collector = {
+        let collected = Arc::clone(&collected_events);
+        tokio::spawn(async move {
+            while let Ok(Some(ev)) =
+                tokio::time::timeout(Duration::from_secs(120), event_rx.recv()).await
+            {
+                let is_terminal = matches!(
+                    ev,
+                    AgentEvent::AutoDone { .. } | AgentEvent::AutoFailed { .. }
+                );
+                eprintln!("[auto-e2e] {ev:?}");
+                collected.lock().unwrap().push(ev);
+                if is_terminal {
+                    break;
+                }
+            }
+        })
+    };
+
+    let result = run_auto(config, event_tx, plan_gen, runner, approver, cancel).await;
+    // Wait for the collector to drain the terminal event.
+    let _ = tokio::time::timeout(Duration::from_secs(5), collector).await;
+
+    // ── Result-level assertions ──
+    match &result {
+        AutoResult::Done { run, summary } => {
+            eprintln!("[auto-e2e] AutoDone summary: {summary}");
+            assert_eq!(run.status, AutoStatus::Done);
+            assert!(!run.plan_versions.is_empty(), "plan must have been generated");
+            assert!(!run.worker_results.is_empty(), "at least one worker must have run");
+            assert!(
+                run.replans_used <= 1,
+                "should not have exhausted replan budget on a simple task; used={}",
+                run.replans_used
+            );
+        }
+        other => panic!(
+            "expected AutoResult::Done for a trivial file-write task, got: {other:?}"
+        ),
+    }
+
+    // ── File-side assertion: the worker actually wrote the file ──
+    let written = std::fs::read_to_string(working_dir.join("result.txt"))
+        .expect("result.txt should exist after Auto task completes");
+    assert_eq!(
+        written.trim_end_matches('\n'),
+        "hello from auto mode",
+        "file contents mismatch; got: {written:?}"
+    );
+
+    // ── Event-stream assertions: the whole bracket fired in order ──
+    let events = collected_events.lock().unwrap().clone();
+    let has = |needle: &str| events.iter().any(|e| format!("{e:?}").contains(needle));
+    assert!(has("AutoPlanning"), "missing AutoPlanning event");
+    assert!(has("AutoPlan {"), "missing AutoPlan event");
+    assert!(has("AutoAwaitingApproval"), "missing AutoAwaitingApproval event");
+    assert!(has("AutoWorkerStart"), "missing AutoWorkerStart event");
+    assert!(has("AutoWorkerEnd"), "missing AutoWorkerEnd event");
+    assert!(has("AutoDone"), "missing AutoDone event");
+    assert!(!has("AutoFailed"), "should not have failed on a trivial task");
+}
