@@ -1249,3 +1249,114 @@ async fn post_anthropic_messages(
         cache_read_input_tokens: get("cache_read_input_tokens"),
     }
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// Auto mode tests (P1+)
+//
+// PHASE_AUTO_MODE.md. P1 covers the worker runtime in isolation — no
+// orchestrator yet. Hand-crafted WorkerSpec is dispatched through
+// `auto::run_worker` and verified end-to-end.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Run a single worker against a real LLM. Verifies the full P1 surface:
+///   - AutoWorkerStart fires with the spec's identity
+///   - the child AgentLoop runs to completion and uses tools
+///   - AutoWorkerEnd fires with status=Ok and a non-empty summary
+///   - the returned WorkerResult mirrors the events
+#[tokio::test]
+#[ignore = "requires LLM_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY"]
+async fn test_auto_run_worker_single_live() {
+    use agent::auto::{run_worker, SeePrior, SeePriorKeyword, WorkerContext, WorkerSpec, WorkerStatus};
+    use agent::llm::client::LlmPolicy;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    let _ = env_logger::try_init();
+    let tmp = tempdir().unwrap();
+    std::fs::write(tmp.path().join("note.txt"), "the answer is 42\n").unwrap();
+
+    // Reuse the file's existing model/provider resolution so this test runs
+    // against whatever the caller's env is configured for (OpenAI or Anthropic).
+    let template = make_config(&api_key(), tmp.path().to_path_buf());
+
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
+    let ctx = WorkerContext {
+        session_id: "parent".into(),
+        run_id: "auto-run-1".into(),
+        working_dir: tmp.path().to_path_buf(),
+        event_tx,
+        cancel_token: CancellationToken::new(),
+        llm_base_config: template.llm.clone(),
+        retry_config: template.retry_config.clone(),
+        compaction_config: template.compaction_config.clone(),
+        compaction_llm: template.compaction_llm.clone(),
+        max_iterations: 20, // small ceiling — this is a 1-tool task
+        context_engine: None,
+        context_engine_repo_path: None,
+        persister: None,
+        approval_handler: None,
+        checkpoint_dir: None,
+    };
+
+    let spec = WorkerSpec {
+        id: "w1".into(),
+        // Inherit the model the test env picked. The orchestrator (P2) will
+        // pick from the worker pool instead.
+        model: template.llm.model.clone(),
+        prompt: "Read the file note.txt in the working directory and report \
+                 its contents in one short sentence."
+            .into(),
+        see_prior: SeePrior::Keyword(SeePriorKeyword::None),
+    };
+
+    // Collect events in parallel with the worker run.
+    let events_handle = tokio::spawn(async move {
+        let mut out = Vec::new();
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(60), event_rx.recv()).await {
+            let is_terminal = matches!(ev, AgentEvent::AutoWorkerEnd { .. });
+            eprintln!("[auto-evt] {ev:?}");
+            out.push(ev);
+            if is_terminal {
+                break;
+            }
+        }
+        out
+    });
+
+    let result = run_worker(&spec, &[], &ctx).await;
+    let events = events_handle.await.expect("event collector panicked");
+
+    // ── assertions ──
+    assert_eq!(result.id, "w1");
+    assert_eq!(result.model, template.llm.model);
+    assert_eq!(
+        result.status,
+        WorkerStatus::Ok,
+        "worker should finish cleanly; got status={:?}, summary={:?}",
+        result.status,
+        result.summary
+    );
+    assert!(
+        result.summary.contains("42") || result.summary.to_lowercase().contains("answer"),
+        "summary should reference the file content; got: {}",
+        result.summary
+    );
+    assert!(result.tool_count >= 1, "worker should have used at least one tool (read)");
+
+    let start_ok = events.iter().any(|e| matches!(
+        e,
+        AgentEvent::AutoWorkerStart { worker_id, run_id, .. }
+            if worker_id == "w1" && run_id == "auto-run-1"
+    ));
+    let end_ok = events.iter().any(|e| matches!(
+        e,
+        AgentEvent::AutoWorkerEnd { worker_id, run_id, .. }
+            if worker_id == "w1" && run_id == "auto-run-1"
+    ));
+    assert!(start_ok, "AutoWorkerStart event missing");
+    assert!(end_ok, "AutoWorkerEnd event missing");
+
+    // Silence unused-import warnings when this is the only test compiled.
+    let _ = (LlmPolicy::default(),);
+}

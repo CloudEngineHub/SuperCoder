@@ -12,9 +12,11 @@
 
 pub mod schema;
 pub mod types;
+pub mod worker;
 
 pub use schema::{submit_plan_input_schema, submit_plan_tool, SUBMIT_PLAN_TOOL_NAME};
 pub use types::{
     AutoResult, AutoRun, AutoStatus, Plan, SeePrior, SeePriorKeyword, WorkerPoolEntry,
     WorkerResult, WorkerSpec, WorkerStatus,
 };
+pub use worker::{run_worker, WorkerContext};
