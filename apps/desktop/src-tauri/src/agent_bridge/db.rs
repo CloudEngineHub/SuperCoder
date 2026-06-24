@@ -142,6 +142,20 @@ impl AgentDb {
                  enabled       INTEGER NOT NULL DEFAULT 1
              );
 
+             CREATE TABLE IF NOT EXISTS auto_runs (
+                 id              TEXT PRIMARY KEY,
+                 session_id      TEXT NOT NULL,
+                 status          TEXT NOT NULL,
+                 plan_versions   TEXT NOT NULL DEFAULT '[]',
+                 worker_results  TEXT NOT NULL DEFAULT '[]',
+                 cost_cents      INTEGER NOT NULL DEFAULT 0,
+                 replans_used    INTEGER NOT NULL DEFAULT 0,
+                 created_at      TEXT NOT NULL,
+                 updated_at      TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_auto_runs_session
+                 ON auto_runs(session_id, updated_at DESC);
+
              PRAGMA user_version = 1;",
         )?;
 
@@ -654,6 +668,148 @@ impl AgentDb {
         let llm = serde_json::json!({"role": "system", "content": summary}).to_string();
         self.insert_message(session_id, project_path, "system", "compaction", &llm, &metadata, None)
     }
+
+    // ── Auto-mode runs ────────────────────────────────────────────────────
+
+    /// Insert a fresh `auto_runs` row when a new Auto task starts.
+    /// `plan_versions` and `worker_results` start as empty JSON arrays; the
+    /// executor calls `update_auto_run` after each phase to flush state.
+    pub fn insert_auto_run(&self, run: &agent::auto::AutoRun) -> Result<(), AgentDbError> {
+        let conn = self.conn.lock();
+        let plan_versions = serde_json::to_string(&run.plan_versions)?;
+        let worker_results = serde_json::to_string(&run.worker_results)?;
+        let status = serde_json::to_string(&run.status)?
+            .trim_matches('"')
+            .to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO auto_runs
+                 (id, session_id, status, plan_versions, worker_results,
+                  cost_cents, replans_used, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                run.id,
+                run.session_id,
+                status,
+                plan_versions,
+                worker_results,
+                run.cost_cents as i64,
+                run.replans_used as i64,
+                now,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Overwrite an existing `auto_runs` row with the executor's latest snapshot.
+    /// Called after each plan / worker / replan / terminal transition so the
+    /// row mirrors the in-memory `AutoRun`.
+    pub fn update_auto_run(&self, run: &agent::auto::AutoRun) -> Result<(), AgentDbError> {
+        let conn = self.conn.lock();
+        let plan_versions = serde_json::to_string(&run.plan_versions)?;
+        let worker_results = serde_json::to_string(&run.worker_results)?;
+        let status = serde_json::to_string(&run.status)?
+            .trim_matches('"')
+            .to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE auto_runs SET
+                 status = ?, plan_versions = ?, worker_results = ?,
+                 cost_cents = ?, replans_used = ?, updated_at = ?
+             WHERE id = ?",
+            rusqlite::params![
+                status,
+                plan_versions,
+                worker_results,
+                run.cost_cents as i64,
+                run.replans_used as i64,
+                now,
+                run.id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load a single `auto_runs` row by id. Returns `None` if missing.
+    pub fn get_auto_run(&self, id: &str) -> Result<Option<agent::auto::AutoRun>, AgentDbError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, status, plan_versions, worker_results,
+                    cost_cents, replans_used
+             FROM auto_runs WHERE id = ?",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![id])?;
+        if let Some(row) = rows.next()? {
+            let status_raw: String = row.get(2)?;
+            let plan_versions_raw: String = row.get(3)?;
+            let worker_results_raw: String = row.get(4)?;
+            // Status round-trip: serde wraps strings in quotes, so we add them
+            // back before deserializing the snake_case-renamed enum.
+            let status: agent::auto::AutoStatus =
+                serde_json::from_str(&format!("\"{}\"", status_raw))?;
+            let plan_versions = serde_json::from_str(&plan_versions_raw)?;
+            let worker_results = serde_json::from_str(&worker_results_raw)?;
+            Ok(Some(agent::auto::AutoRun {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                status,
+                plan_versions,
+                worker_results,
+                cost_cents: row.get::<_, i64>(5)? as u32,
+                replans_used: row.get::<_, i64>(6)? as u32,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// List `auto_runs` rows for a session, most-recently-updated first.
+    /// Used by the UI to surface prior Auto invocations under a session.
+    pub fn list_auto_runs_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<agent::auto::AutoRun>, AgentDbError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, status, plan_versions, worker_results,
+                    cost_cents, replans_used
+             FROM auto_runs WHERE session_id = ?
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+            // Defer serde to outside the closure; capture raw strings here so
+            // the closure stays rusqlite::Error-typed.
+            let status_raw: String = row.get(2)?;
+            let plan_versions_raw: String = row.get(3)?;
+            let worker_results_raw: String = row.get(4)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                status_raw,
+                plan_versions_raw,
+                worker_results_raw,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, session_id, status_raw, plans_raw, results_raw, cost, replans) = row?;
+            let status: agent::auto::AutoStatus =
+                serde_json::from_str(&format!("\"{}\"", status_raw))?;
+            out.push(agent::auto::AutoRun {
+                id,
+                session_id,
+                status,
+                plan_versions: serde_json::from_str(&plans_raw)?,
+                worker_results: serde_json::from_str(&results_raw)?,
+                cost_cents: cost as u32,
+                replans_used: replans as u32,
+            });
+        }
+        Ok(out)
+    }
 }
 
 // ── Row mappers ──────────────────────────────────────────────────────────────
@@ -1129,5 +1285,143 @@ mod tests {
         let remaining = db.load_session_messages("t1").unwrap();
         assert_eq!(remaining.len(), 1);
         assert!(remaining[0].llm_message.contains("keep"));
+    }
+
+    // ── auto_runs (P4) ────────────────────────────────────────────────────
+
+    /// End-to-end CRUD on the `auto_runs` table. Pins:
+    ///   - status enum round-trip (snake_case in DB, restored to variant)
+    ///   - plan_versions + worker_results JSON columns survive non-trivial
+    ///     nested payloads (Plan with workers, WorkerResult with status)
+    ///   - update overwrites status / cost / replans correctly
+    ///   - list_for_session ordering is by updated_at DESC
+    ///   - get_auto_run returns None for unknown id
+    #[test]
+    fn test_auto_runs_crud_roundtrip() {
+        use agent::auto::{
+            AutoRun, AutoStatus, Plan, SeePrior, SeePriorKeyword, WorkerResult, WorkerSpec,
+            WorkerStatus,
+        };
+
+        let (_d, db) = make_db();
+
+        let initial = AutoRun {
+            id: "auto-1".into(),
+            session_id: "sess-1".into(),
+            status: AutoStatus::Planning,
+            plan_versions: Vec::new(),
+            worker_results: Vec::new(),
+            cost_cents: 0,
+            replans_used: 0,
+        };
+        db.insert_auto_run(&initial).unwrap();
+
+        // Fresh insert is readable.
+        let loaded = db.get_auto_run("auto-1").unwrap().expect("row should exist");
+        assert_eq!(loaded.id, "auto-1");
+        assert_eq!(loaded.session_id, "sess-1");
+        assert_eq!(loaded.status, AutoStatus::Planning);
+        assert!(loaded.plan_versions.is_empty());
+        assert!(loaded.worker_results.is_empty());
+
+        // Update with non-trivial nested payloads.
+        let updated = AutoRun {
+            id: "auto-1".into(),
+            session_id: "sess-1".into(),
+            status: AutoStatus::Done,
+            plan_versions: vec![Plan {
+                version: 1,
+                reasoning: "decompose into one cheap worker".into(),
+                workers: vec![WorkerSpec {
+                    id: "w1".into(),
+                    model: "claude-haiku-4-5".into(),
+                    prompt: "read README".into(),
+                    see_prior: SeePrior::Keyword(SeePriorKeyword::None),
+                }],
+            }],
+            worker_results: vec![WorkerResult {
+                id: "w1".into(),
+                model: "claude-haiku-4-5".into(),
+                prompt: "read README".into(),
+                summary: "README describes a Rust project".into(),
+                tool_count: 1,
+                cost_cents: 3,
+                status: WorkerStatus::Ok,
+            }],
+            cost_cents: 42,
+            replans_used: 1,
+        };
+        db.update_auto_run(&updated).unwrap();
+
+        let reloaded = db.get_auto_run("auto-1").unwrap().unwrap();
+        assert_eq!(reloaded.status, AutoStatus::Done);
+        assert_eq!(reloaded.cost_cents, 42);
+        assert_eq!(reloaded.replans_used, 1);
+        assert_eq!(reloaded.plan_versions.len(), 1);
+        let plan = &reloaded.plan_versions[0];
+        assert_eq!(plan.version, 1);
+        assert_eq!(plan.workers.len(), 1);
+        assert_eq!(plan.workers[0].id, "w1");
+        assert!(matches!(plan.workers[0].see_prior, SeePrior::Keyword(SeePriorKeyword::None)));
+        assert_eq!(reloaded.worker_results.len(), 1);
+        let result = &reloaded.worker_results[0];
+        assert_eq!(result.summary, "README describes a Rust project");
+        assert_eq!(result.status, WorkerStatus::Ok);
+
+        // Unknown id returns None, not error.
+        assert!(db.get_auto_run("does-not-exist").unwrap().is_none());
+
+        // list_auto_runs_for_session returns this run; insert a second one for
+        // a different session to confirm filtering.
+        let other = AutoRun {
+            id: "auto-2".into(),
+            session_id: "sess-2".into(),
+            status: AutoStatus::Failed,
+            plan_versions: Vec::new(),
+            worker_results: Vec::new(),
+            cost_cents: 0,
+            replans_used: 0,
+        };
+        db.insert_auto_run(&other).unwrap();
+        let runs = db.list_auto_runs_for_session("sess-1").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, "auto-1");
+        let other_runs = db.list_auto_runs_for_session("sess-2").unwrap();
+        assert_eq!(other_runs.len(), 1);
+        assert_eq!(other_runs[0].status, AutoStatus::Failed);
+    }
+
+    /// Every `AutoStatus` variant must round-trip through the DB column. If
+    /// the snake_case serde tag drifts, this catches it before users see a
+    /// silent rename.
+    #[test]
+    fn test_auto_runs_status_all_variants_roundtrip() {
+        use agent::auto::{AutoRun, AutoStatus};
+        let (_d, db) = make_db();
+        for (i, status) in [
+            AutoStatus::Planning,
+            AutoStatus::AwaitingApproval,
+            AutoStatus::Running,
+            AutoStatus::Done,
+            AutoStatus::Failed,
+            AutoStatus::Cancelled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("auto-{i}");
+            let run = AutoRun {
+                id: id.clone(),
+                session_id: "sess".into(),
+                status,
+                plan_versions: Vec::new(),
+                worker_results: Vec::new(),
+                cost_cents: 0,
+                replans_used: 0,
+            };
+            db.insert_auto_run(&run).unwrap();
+            let loaded = db.get_auto_run(&id).unwrap().unwrap();
+            assert_eq!(loaded.status, status, "{status:?} did not round-trip");
+        }
     }
 }

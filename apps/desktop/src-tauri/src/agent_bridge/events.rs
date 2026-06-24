@@ -426,16 +426,134 @@ async fn relay_event(
         }
 
         // ── Auto mode events (PHASE_AUTO_MODE.md) ──
-        // Emitted by the executor (P3+). Frontend wiring lands in P6 — for
-        // now these are no-ops at the relay layer. Terminal variants
-        // (AutoDone / AutoFailed) terminate the loop just like Done.
-        AgentEvent::AutoPlanning { .. }
-        | AgentEvent::AutoPlan { .. }
-        | AgentEvent::AutoAwaitingApproval { .. }
-        | AgentEvent::AutoWorkerStart { .. }
-        | AgentEvent::AutoWorkerEnd { .. }
-        | AgentEvent::AutoReplan { .. } => false,
-        AgentEvent::AutoDone { .. } | AgentEvent::AutoFailed { .. } => true,
+        // Forward each to the frontend under `agent:auto_*` channels. The UI
+        // (P6) subscribes to these to render plan cards, worker cards, and the
+        // final result. Terminal variants (AutoDone / AutoFailed) terminate
+        // the relay loop just like the regular Done.
+        AgentEvent::AutoPlanning { run_id, .. } => {
+            emit_or_log(
+                ctx.emitter.as_ref(),
+                "agent:auto_planning",
+                serde_json::json!({ "thread_id": tid, "run_id": run_id }),
+            );
+            false
+        }
+        AgentEvent::AutoPlan {
+            run_id,
+            version,
+            reasoning,
+            plan,
+            ..
+        } => {
+            emit_or_log(
+                ctx.emitter.as_ref(),
+                "agent:auto_plan",
+                serde_json::json!({
+                    "thread_id": tid,
+                    "run_id": run_id,
+                    "version": version,
+                    "reasoning": reasoning,
+                    "plan": plan,
+                }),
+            );
+            false
+        }
+        AgentEvent::AutoAwaitingApproval { run_id, .. } => {
+            emit_or_log(
+                ctx.emitter.as_ref(),
+                "agent:auto_awaiting_approval",
+                serde_json::json!({ "thread_id": tid, "run_id": run_id }),
+            );
+            false
+        }
+        AgentEvent::AutoWorkerStart {
+            run_id,
+            worker_id,
+            model,
+            prompt,
+            ..
+        } => {
+            emit_or_log(
+                ctx.emitter.as_ref(),
+                "agent:auto_worker_start",
+                serde_json::json!({
+                    "thread_id": tid,
+                    "run_id": run_id,
+                    "worker_id": worker_id,
+                    "model": model,
+                    "prompt": prompt,
+                }),
+            );
+            false
+        }
+        AgentEvent::AutoWorkerEnd {
+            run_id,
+            worker_id,
+            summary,
+            cost_cents,
+            tool_count,
+            status,
+            ..
+        } => {
+            emit_or_log(
+                ctx.emitter.as_ref(),
+                "agent:auto_worker_end",
+                serde_json::json!({
+                    "thread_id": tid,
+                    "run_id": run_id,
+                    "worker_id": worker_id,
+                    "summary": summary,
+                    "cost_cents": cost_cents,
+                    "tool_count": tool_count,
+                    "status": status,
+                }),
+            );
+            false
+        }
+        AgentEvent::AutoReplan { run_id, reason, .. } => {
+            emit_or_log(
+                ctx.emitter.as_ref(),
+                "agent:auto_replan",
+                serde_json::json!({ "thread_id": tid, "run_id": run_id, "reason": reason }),
+            );
+            false
+        }
+        AgentEvent::AutoFailed {
+            run_id,
+            reason,
+            last_worker_output,
+            ..
+        } => {
+            emit_or_log(
+                ctx.emitter.as_ref(),
+                "agent:auto_failed",
+                serde_json::json!({
+                    "thread_id": tid,
+                    "run_id": run_id,
+                    "reason": reason,
+                    "last_worker_output": last_worker_output,
+                }),
+            );
+            true
+        }
+        AgentEvent::AutoDone {
+            run_id,
+            summary,
+            total_cost_cents,
+            ..
+        } => {
+            emit_or_log(
+                ctx.emitter.as_ref(),
+                "agent:auto_done",
+                serde_json::json!({
+                    "thread_id": tid,
+                    "run_id": run_id,
+                    "summary": summary,
+                    "total_cost_cents": total_cost_cents,
+                }),
+            );
+            true
+        }
     }
 }
 

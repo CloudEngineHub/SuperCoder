@@ -37,6 +37,10 @@ pub struct AgentState {
     pub(crate) approval_handlers: RwLock<std::collections::HashMap<String, Arc<TauriApprovalHandler>>>,
     pub(crate) model_registry: RwLock<agent::agent::model_profile::ModelRegistry>,
     pub(crate) write_lock_registry: Arc<agent::subagents::WriteLockRegistry>,
+    /// Auto-mode plan-approval channel registry. `TauriPlanApprover::approve`
+    /// inserts a `oneshot::Sender<bool>` keyed by `run_id`;
+    /// `agent_approve_auto_plan` drains it. See `agent_bridge::auto`.
+    pub(crate) auto_plan_pending: crate::agent_bridge::auto::AutoApprovalPending,
 }
 
 impl AgentState {
@@ -49,6 +53,7 @@ impl AgentState {
             approval_handlers: RwLock::new(std::collections::HashMap::new()),
             model_registry: RwLock::new(agent::agent::model_profile::ModelRegistry::with_defaults()),
             write_lock_registry: Arc::new(agent::subagents::WriteLockRegistry::new()),
+            auto_plan_pending: crate::agent_bridge::auto::new_pending_map(),
         }
     }
 
@@ -546,6 +551,26 @@ pub async fn agent_context_engine_delete_repo(
 
 fn provider_by_id(app_state: &AppState, id: &str) -> Option<ProviderConfig> {
     read_providers(app_state).into_iter().find(|p| p.id == id)
+}
+
+/// Public wrapper used by the `agent_bridge::auto` module to look up the
+/// orchestrator's provider. Same semantics as the private `provider_by_id`.
+pub(crate) fn provider_by_id_pub(app_state: &AppState, id: &str) -> Option<ProviderConfig> {
+    provider_by_id(app_state, id)
+}
+
+/// True iff this session resolves to Auto mode — either explicitly
+/// (`session.provider_id` + `session.model` are the Auto sentinel) or
+/// implicitly via the global active selection.
+fn resolve_session_auto_mode(session: &SessionRow, app_state: &AppState) -> bool {
+    use crate::agent_bridge::auto::is_auto_mode;
+    match (session.provider_id.as_deref(), session.model.as_deref()) {
+        (Some(pid), Some(model)) => is_auto_mode(pid, model),
+        _ => match read_selection(app_state).active {
+            Some(r) => is_auto_mode(&r.provider_id, &r.model),
+            None => false,
+        },
+    }
 }
 
 /// Resolve a `ModelRef` to its provider + model id.
@@ -1328,6 +1353,44 @@ async fn run_agent_turn(
         return Err(format!("Folder does not exist: {folder}"));
     }
 
+    // ── Auto mode branch ──
+    // If this session is in Auto mode (sentinel provider/model on the row, or
+    // the global active selection is the sentinel), dispatch to the Auto
+    // executor instead of the regular agent loop. The Auto path owns its own
+    // folder-release on completion via `on_complete`.
+    if resolve_session_auto_mode(&session, app_state) {
+        let folder_for_release_closure = folder.clone();
+        let folder_for_call = folder.clone();
+        let folder_for_err = folder.clone();
+        let running_for_release = Arc::clone(&agent_state.running_folders);
+        let release_folder = move || {
+            let running = running_for_release;
+            let folder = folder_for_release_closure;
+            tokio::spawn(async move {
+                running.write().await.remove(&folder);
+            });
+        };
+        return match crate::agent_bridge::auto::run_auto_turn(
+            app_handle,
+            app_state,
+            agent_state,
+            session_id,
+            folder_for_call,
+            message,
+            release_folder,
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // run_auto_turn returned early without spawning the task; the
+                // on_complete callback will never fire, so release here.
+                release(folder_for_err);
+                Err(e)
+            }
+        };
+    }
+
     let (provider, model) = match session_model(app_state, &session) {
         Ok(pm) => pm,
         Err(e) => {
@@ -1904,8 +1967,15 @@ pub async fn agent_set_model_selection(
     model: String,
     app_state: State<'_, AppState>,
 ) -> Result<(), String> {
-    if provider_by_id(&app_state, &provider_id).is_none() {
+    // Auto sentinel skips the provider-exists check. It's a virtual model
+    // that dispatches into the Auto executor at spawn time. Only valid for
+    // the "active" role — compaction/title don't make sense as Auto.
+    let is_auto = crate::agent_bridge::auto::is_auto_mode(&provider_id, &model);
+    if !is_auto && provider_by_id(&app_state, &provider_id).is_none() {
         return Err(format!("Provider not found: {provider_id}"));
+    }
+    if is_auto && role != "active" {
+        return Err(format!("Auto mode only applies to `active` role, not `{role}`"));
     }
     let mut sel = read_selection(&app_state);
     let r = Some(ModelRef { provider_id, model });
