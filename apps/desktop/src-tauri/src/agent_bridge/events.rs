@@ -424,6 +424,18 @@ async fn relay_event(
             );
             false
         }
+
+        // ── Auto mode events (PHASE_AUTO_MODE.md) ──
+        // Emitted by the executor (P3+). Frontend wiring lands in P6 — for
+        // now these are no-ops at the relay layer. Terminal variants
+        // (AutoDone / AutoFailed) terminate the loop just like Done.
+        AgentEvent::AutoPlanning { .. }
+        | AgentEvent::AutoPlan { .. }
+        | AgentEvent::AutoAwaitingApproval { .. }
+        | AgentEvent::AutoWorkerStart { .. }
+        | AgentEvent::AutoWorkerEnd { .. }
+        | AgentEvent::AutoReplan { .. } => false,
+        AgentEvent::AutoDone { .. } | AgentEvent::AutoFailed { .. } => true,
     }
 }
 

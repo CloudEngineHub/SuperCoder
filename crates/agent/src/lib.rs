@@ -11,6 +11,7 @@ pub mod session;
 pub mod context_engine;
 pub mod skills;
 pub mod subagents;
+pub mod auto;
 
 #[cfg(test)]
 pub mod test_util;

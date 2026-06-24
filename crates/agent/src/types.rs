@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+use crate::auto::{WorkerSpec, WorkerStatus};
+
 /// Events emitted by the agent loop for UI consumption.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
@@ -108,6 +110,69 @@ pub enum AgentEvent {
         child_session_id: String,
         success: bool,
         summary: String,
+    },
+
+    // ── Auto mode (orchestrator + workers) ──
+    // See PHASE_AUTO_MODE.md "AgentEvent additions" for the canonical list.
+
+    /// Auto: the orchestrator LLM call is in flight.
+    AutoPlanning {
+        session_id: String,
+        run_id: String,
+    },
+    /// Auto: orchestrator emitted a (new or revised) plan. `version` matches
+    /// `Plan::version` — initial plan is 1; replans increment.
+    AutoPlan {
+        session_id: String,
+        run_id: String,
+        version: u32,
+        reasoning: String,
+        plan: Vec<WorkerSpec>,
+    },
+    /// Auto: plan rendered to the user; executor is blocked on the Run button.
+    AutoAwaitingApproval {
+        session_id: String,
+        run_id: String,
+    },
+    /// Auto: a worker has started executing.
+    AutoWorkerStart {
+        session_id: String,
+        run_id: String,
+        worker_id: String,
+        model: String,
+        prompt: String,
+    },
+    /// Auto: a worker finished (success or failure). Hard-failure statuses
+    /// trigger a reactive replan in the executor.
+    AutoWorkerEnd {
+        session_id: String,
+        run_id: String,
+        worker_id: String,
+        summary: String,
+        cost_cents: u32,
+        tool_count: u32,
+        status: WorkerStatus,
+    },
+    /// Auto: a worker failed and the orchestrator is being re-invoked.
+    AutoReplan {
+        session_id: String,
+        run_id: String,
+        reason: String,
+    },
+    /// Auto: replan budget exhausted. No silent fallback — user decides next move.
+    AutoFailed {
+        session_id: String,
+        run_id: String,
+        reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_worker_output: Option<String>,
+    },
+    /// Auto: all workers finished successfully (possibly after replans).
+    AutoDone {
+        session_id: String,
+        run_id: String,
+        summary: String,
+        total_cost_cents: u32,
     },
 }
 

@@ -1,0 +1,20 @@
+//! Auto mode — orchestrator-driven multi-model coding.
+//!
+//! See PHASE_AUTO_MODE.md for the locked design + phase plan. This crate
+//! sub-module is architecturally distinct from `crate::subagents` (no
+//! `SubagentRegistry` coupling) and reuses only the spawning skeleton.
+//!
+//! Phase status:
+//!   P0 (current): types + schema only. No behavior.
+//!   P1: `worker.rs` — ephemeral worker runtime.
+//!   P2: `orchestrator.rs` — orchestrator LLM call + plan parsing (forced tool use).
+//!   P3: `executor.rs` — sequencer + reactive replan loop.
+
+pub mod schema;
+pub mod types;
+
+pub use schema::{submit_plan_input_schema, submit_plan_tool, SUBMIT_PLAN_TOOL_NAME};
+pub use types::{
+    AutoResult, AutoRun, AutoStatus, Plan, SeePrior, SeePriorKeyword, WorkerPoolEntry,
+    WorkerResult, WorkerSpec, WorkerStatus,
+};
