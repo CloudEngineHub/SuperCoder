@@ -1072,3 +1072,180 @@ async fn test_caching_emits_cache_tokens_across_turns() {
         );
     }
 }
+
+/// Surgical, request-shape end-to-end check that the system-prompt
+/// cache_control fix lands correctly on the wire. Complements
+/// `test_caching_emits_cache_tokens_across_turns` (which runs the full agent
+/// loop): this one bypasses the agent and posts a hand-built request, so it
+/// isolates the system-block cache marker logic.
+///
+/// Worst-case shape (semantic search ON + skills present + tools present)
+/// used to emit 5 cache_control markers, exceeding Anthropic's 4-marker cap.
+/// The fix collapses the system contribution to exactly one marker — total 3
+/// on the wire (system + last user message + last tool).
+///
+/// Asserts:
+///   1. The serialized request carries exactly 3 cache_control markers.
+///   2. Anthropic accepts the request (no "too many cache breakpoints" 400).
+///   3. Caching actually works — a second identical request must read from cache.
+#[tokio::test]
+#[ignore = "requires ANTHROPIC_API_KEY"]
+async fn test_system_prompt_cache_breakpoints_under_anthropic_limit() {
+    use agent::agent::prompt::build_system_prompt;
+    use agent::llm::anthropic::build_anthropic_request;
+    use agent::llm::types::{
+        ChatMessage, ContentBlock, FunctionDefinition, MessageContent, ToolDefinition,
+    };
+    use agent::llm::{LlmClientConfig, Provider};
+    use agent::skills::{registry::SkillInput, SkillRegistry};
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    let api_key = api_key();
+
+    // Worst-case shape: context-engine ON + non-empty skill registry.
+    let registry = SkillRegistry::new(
+        vec![],
+        vec![SkillInput {
+            raw: "---\nname: hello\ndescription: greeting skill.\n---\nbody\n".into(),
+            path: PathBuf::from("/hello"),
+        }],
+        vec![],
+        &HashSet::new(),
+    );
+    let system_blocks = build_system_prompt(
+        ToolMode::Coding,
+        &PathBuf::from("/p"),
+        Some("main"),
+        None,
+        Some(&registry),
+        None,
+        /*context_engine_enabled=*/ true,
+    );
+
+    // ChatMessage::system() uses MessageContent::Text and would lose per-block
+    // cache_control. Build the struct manually with Blocks to preserve markers.
+    let system_msg = ChatMessage {
+        role: "system".into(),
+        content: Some(MessageContent::Blocks(
+            system_blocks
+                .into_iter()
+                .map(|b| ContentBlock::Text { text: b.text, cache_control: b.cache_control })
+                .collect(),
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+        thinking: None,
+    };
+    let user_msg = ChatMessage::user("Respond with the single word READY and nothing else.");
+    let messages = vec![system_msg, user_msg];
+
+    // One dummy tool so the tools-level cache marker also fires.
+    let tools = vec![ToolDefinition {
+        type_: "function".into(),
+        function: FunctionDefinition {
+            name: "noop".into(),
+            description: Some("never invoked; present only to exercise tools-level cache".into()),
+            parameters: Some(json!({"type": "object", "properties": {}, "additionalProperties": false})),
+        },
+        cache_control: None,
+    }];
+
+    let cfg = LlmClientConfig {
+        provider: Provider::Anthropic,
+        base_url: "https://api.anthropic.com".into(),
+        model: "claude-sonnet-4-6".into(),
+        api_key: api_key.clone(),
+        temperature: Some(0.0),
+        max_completion_tokens: Some(32),
+        extra_headers: vec![],
+        thinking: None,
+        disable_cache_control: false,
+        policy: Default::default(),
+    };
+
+    let mut req = build_anthropic_request(&messages, &tools, &cfg);
+    req.stream = false;
+
+    // (1) Marker count invariant — exactly 3 markers on the wire.
+    let body = serde_json::to_value(&req).expect("serialize request");
+    let markers = count_cache_control_markers(&body);
+    eprintln!("[live] cache_control markers in serialized request: {markers}");
+    assert_eq!(
+        markers, 3,
+        "expected exactly 3 cache_control markers (system+message+tool); got {markers}"
+    );
+
+    let http = reqwest::Client::new();
+
+    // (2) Call 1: cache freshly written OR (on re-run within the 5m TTL window)
+    // read from a prior run. Either is a healthy caching signal.
+    let usage1 = post_anthropic_messages(&http, &api_key, &body).await;
+    eprintln!("[live] call 1 usage: {usage1:?}");
+    assert!(
+        usage1.cache_creation_input_tokens > 0 || usage1.cache_read_input_tokens > 0,
+        "first call must produce cache stats (write or read) (got {usage1:?})"
+    );
+
+    // (3) Call 2: an identical request issued immediately MUST read from cache.
+    let usage2 = post_anthropic_messages(&http, &api_key, &body).await;
+    eprintln!("[live] call 2 usage: {usage2:?}");
+    assert!(
+        usage2.cache_read_input_tokens > 0,
+        "second identical call must read from the cache (got {usage2:?})"
+    );
+}
+
+fn count_cache_control_markers(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mine = matches!(map.get("cache_control"), Some(v) if !v.is_null()) as usize;
+            mine + map.values().map(count_cache_control_markers).sum::<usize>()
+        }
+        serde_json::Value::Array(arr) => arr.iter().map(count_cache_control_markers).sum(),
+        _ => 0,
+    }
+}
+
+#[derive(Debug, Default)]
+#[allow(dead_code)] // fields are read via Debug in eprintln only
+struct AnthropicUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_creation_input_tokens: u32,
+    cache_read_input_tokens: u32,
+}
+
+async fn post_anthropic_messages(
+    http: &reqwest::Client,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> AnthropicUsage {
+    use agent::llm::anthropic::ANTHROPIC_VERSION;
+    let resp = http
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("content-type", "application/json")
+        .json(body)
+        .send()
+        .await
+        .expect("HTTP send failed");
+    let status = resp.status();
+    let text = resp.text().await.expect("read body");
+    assert!(
+        status.is_success(),
+        "Anthropic API returned {status}: {}",
+        &text[..text.len().min(1000)]
+    );
+    let v: serde_json::Value = serde_json::from_str(&text).expect("parse response");
+    let u = v.get("usage").cloned().unwrap_or(serde_json::Value::Null);
+    let get = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    AnthropicUsage {
+        input_tokens: get("input_tokens"),
+        output_tokens: get("output_tokens"),
+        cache_creation_input_tokens: get("cache_creation_input_tokens"),
+        cache_read_input_tokens: get("cache_read_input_tokens"),
+    }
+}
