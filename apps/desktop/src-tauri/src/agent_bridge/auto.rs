@@ -56,10 +56,16 @@ pub const AUTO_SENTINEL_PROVIDER_ID: &str = "auto";
 pub const AUTO_SENTINEL_MODEL: &str = "auto";
 
 /// Settings DB keys. Same k-v table that holds `llm_selection`,
-/// `llm_providers`, `context_engine`. Values are JSON strings.
+/// `llm_providers`, `context_engine`. Values are JSON strings (or raw for
+/// the bool/u32 keys).
 const AUTO_ORCHESTRATOR_KEY: &str = "auto_orchestrator_model";
 const AUTO_WORKER_POOL_KEY: &str = "auto_worker_pool";
 const AUTO_REPLAN_BUDGET_KEY: &str = "auto_replan_budget";
+/// Master switch. Auto entry is shown in the model picker iff this is true.
+/// Prereqs (orchestrator picked + worker pool non-empty) are enforced by
+/// `agent_set_auto_enabled` when flipping on, and by a live-session check
+/// when flipping off (see `agent_list_sessions_using_auto`).
+const AUTO_ENABLED_KEY: &str = "auto_enabled";
 
 /// Default replan budget when the user has not configured it.
 /// Matches PHASE_AUTO_MODE.md "Replan budget" decision.
@@ -72,11 +78,14 @@ pub fn is_auto_mode(provider_id: &str, model: &str) -> bool {
 
 // ── Settings DTO + persistence ───────────────────────────────────────────
 
-/// All three Auto settings in a single struct, returned by
+/// All four Auto settings in a single struct, returned by
 /// `agent_get_auto_settings` for the Settings UI to consume.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoSettings {
+    /// Master switch. `true` ⇒ the Auto entry appears in the model picker
+    /// and `run_auto_turn` accepts dispatches. `false` ⇒ both gates closed.
+    pub enabled: bool,
     /// User-picked orchestrator model. `None` when Auto mode is not yet
     /// configured — `run_auto_turn` rejects with a "not configured" error
     /// in that case.
@@ -117,8 +126,19 @@ pub(crate) fn read_auto_replan_budget(app_state: &AppState) -> u32 {
         .unwrap_or(DEFAULT_REPLAN_BUDGET)
 }
 
+pub(crate) fn read_auto_enabled(app_state: &AppState) -> bool {
+    app_state
+        .db
+        .get_setting(AUTO_ENABLED_KEY)
+        .ok()
+        .flatten()
+        .map(|raw| raw == "true")
+        .unwrap_or(false)
+}
+
 pub(crate) fn read_auto_settings(app_state: &AppState) -> AutoSettings {
     AutoSettings {
+        enabled: read_auto_enabled(app_state),
         orchestrator: read_auto_orchestrator(app_state),
         worker_pool: read_auto_worker_pool(app_state),
         replan_budget: read_auto_replan_budget(app_state),
@@ -169,6 +189,74 @@ pub async fn agent_set_auto_replan_budget(
         ));
     }
     app_state.db.set_setting(AUTO_REPLAN_BUDGET_KEY, &budget.to_string())
+}
+
+/// Flip the master Auto-enable switch.
+/// - On ENABLE: prerequisites must be met (orchestrator picked + non-empty
+///   worker pool). The Settings UI also gates the toggle, but this is the
+///   authoritative check.
+/// - On DISABLE: no session may currently have Auto as its active model.
+///   The Settings UI surfaces the offending sessions in a modal; the user
+///   must switch them off Auto before they can disable the feature. This
+///   matches the locked design's "block disable" decision.
+#[tauri::command]
+pub async fn agent_set_auto_enabled(
+    enabled: bool,
+    app_state: State<'_, AppState>,
+    agent_state: State<'_, AgentState>,
+) -> Result<(), String> {
+    if enabled {
+        // Prereqs: orchestrator picked + pool non-empty.
+        if read_auto_orchestrator(&app_state).is_none() {
+            return Err(
+                "Cannot enable Auto: pick an orchestrator model in Settings → Auto first.".into(),
+            );
+        }
+        if read_auto_worker_pool(&app_state).is_empty() {
+            return Err(
+                "Cannot enable Auto: add at least one model to the worker pool first.".into(),
+            );
+        }
+    } else {
+        // Block disable if any session still references Auto.
+        let blockers = list_sessions_using_auto_impl(&agent_state).await?;
+        if !blockers.is_empty() {
+            return Err(format!(
+                "Cannot disable Auto: {} session(s) still use it. Switch them to a regular model first.",
+                blockers.len()
+            ));
+        }
+    }
+    app_state
+        .db
+        .set_setting(AUTO_ENABLED_KEY, if enabled { "true" } else { "false" })
+}
+
+/// List sessions whose active model is the Auto sentinel. Used by the
+/// Settings UI to populate the "switch these first" modal when the user
+/// tries to disable Auto. Excludes soft-deleted sessions.
+#[tauri::command]
+pub async fn agent_list_sessions_using_auto(
+    agent_state: State<'_, AgentState>,
+) -> Result<Vec<super::db::SessionRow>, String> {
+    list_sessions_using_auto_impl(&agent_state).await
+}
+
+async fn list_sessions_using_auto_impl(
+    agent_state: &AgentState,
+) -> Result<Vec<super::db::SessionRow>, String> {
+    let db = Arc::clone(&agent_state.db);
+    let all = tokio::task::spawn_blocking(move || db.list_sessions())
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+        .map_err(|e| format!("Failed to list sessions: {e}"))?;
+    Ok(all
+        .into_iter()
+        .filter(|s| match (s.provider_id.as_deref(), s.model.as_deref()) {
+            (Some(p), Some(m)) => is_auto_mode(p, m),
+            _ => false,
+        })
+        .collect())
 }
 
 // ── Plan approval ────────────────────────────────────────────────────────
@@ -254,6 +342,11 @@ pub async fn run_auto_turn(
 ) -> Result<(), String> {
     // ── 1. Validate settings ──
     let settings = read_auto_settings(app_state);
+    if !settings.enabled {
+        return Err(
+            "Auto mode is disabled in Settings. Re-enable it, or pick a regular model.".into(),
+        );
+    }
     let Some(orchestrator_ref) = settings.orchestrator else {
         return Err("Auto mode: orchestrator model not configured in Settings → Auto".into());
     };
@@ -516,7 +609,7 @@ mod tests {
     // ── composite read_auto_settings ──
 
     #[test]
-    fn read_auto_settings_assembles_all_three_keys() {
+    fn read_auto_settings_assembles_all_four_keys() {
         let state = mk_app_state();
         let model = ModelRef {
             provider_id: "anthropic".into(),
@@ -536,11 +629,41 @@ mod tests {
             .set_setting(AUTO_WORKER_POOL_KEY, &serde_json::to_string(&pool).unwrap())
             .unwrap();
         state.db.set_setting(AUTO_REPLAN_BUDGET_KEY, "3").unwrap();
+        state.db.set_setting(AUTO_ENABLED_KEY, "true").unwrap();
 
         let s = read_auto_settings(&state);
+        assert!(s.enabled);
         assert!(s.orchestrator.is_some());
         assert_eq!(s.orchestrator.unwrap().model, "claude-sonnet-4-6");
         assert_eq!(s.worker_pool.len(), 1);
         assert_eq!(s.replan_budget, 3);
+    }
+
+    // ── enabled flag ──
+
+    #[test]
+    fn enabled_defaults_false_when_unset() {
+        let state = mk_app_state();
+        assert!(!read_auto_enabled(&state));
+        assert!(!read_auto_settings(&state).enabled);
+    }
+
+    #[test]
+    fn enabled_roundtrips_both_directions() {
+        let state = mk_app_state();
+        state.db.set_setting(AUTO_ENABLED_KEY, "true").unwrap();
+        assert!(read_auto_enabled(&state));
+        state.db.set_setting(AUTO_ENABLED_KEY, "false").unwrap();
+        assert!(!read_auto_enabled(&state));
+    }
+
+    #[test]
+    fn enabled_defaults_false_when_value_is_garbage() {
+        // Anything other than "true" → false. No partial-truth like "yes".
+        let state = mk_app_state();
+        state.db.set_setting(AUTO_ENABLED_KEY, "yes").unwrap();
+        assert!(!read_auto_enabled(&state));
+        state.db.set_setting(AUTO_ENABLED_KEY, "1").unwrap();
+        assert!(!read_auto_enabled(&state));
     }
 }

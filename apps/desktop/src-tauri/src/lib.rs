@@ -650,6 +650,8 @@ pub fn run() {
             agent_bridge::auto::agent_set_auto_orchestrator_model,
             agent_bridge::auto::agent_set_auto_worker_pool,
             agent_bridge::auto::agent_set_auto_replan_budget,
+            agent_bridge::auto::agent_set_auto_enabled,
+            agent_bridge::auto::agent_list_sessions_using_auto,
             agent_bridge::auto::agent_approve_auto_plan,
             agent_bridge::commands::agent_get_context_engine,
             agent_bridge::commands::agent_set_context_engine,
