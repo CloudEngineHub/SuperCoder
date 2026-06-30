@@ -236,6 +236,15 @@ pub struct FunctionDefinition {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameters: Option<serde_json::Value>,
+    /// OpenAI "structured outputs" enforcement. When `Some(true)`, the
+    /// provider guarantees the tool-call arguments conform to `parameters`
+    /// via constrained decoding. Requires `parameters` to use the restricted
+    /// schema subset OpenAI accepts (no `pattern`, `minLength`, `minItems`;
+    /// `additionalProperties: false` everywhere; all `properties` keys must
+    /// appear in `required`). Skipped on the wire when `None` so Anthropic
+    /// requests stay untouched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 // ── Tool call (in assistant response) ──
@@ -381,6 +390,7 @@ mod cache_control_tests {
                 name: "read".into(),
                 description: None,
                 parameters: None,
+                strict: None,
             },
             cache_control: None,
         };
@@ -396,6 +406,7 @@ mod cache_control_tests {
                 name: "read".into(),
                 description: None,
                 parameters: None,
+                strict: None,
             },
             cache_control: Some(CacheControl::ephemeral()),
         };

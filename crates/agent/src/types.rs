@@ -153,6 +153,27 @@ pub enum AgentEvent {
         tool_count: u32,
         status: WorkerStatus,
     },
+    /// Auto: a worker's child AgentLoop is about to execute a tool. Lets the
+    /// UI render live tool activity inside the running worker card. Re-emitted
+    /// by `auto::worker`'s drain task — the worker's own ToolStart event
+    /// fires on its private channel, this is the parent-visible echo.
+    AutoWorkerToolStart {
+        session_id: String,
+        run_id: String,
+        worker_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        args_summary: String,
+    },
+    /// Auto: a worker's tool call finished. Paired with `AutoWorkerToolStart`.
+    AutoWorkerToolEnd {
+        session_id: String,
+        run_id: String,
+        worker_id: String,
+        tool_call_id: String,
+        success: bool,
+        summary: String,
+    },
     /// Auto: a worker failed and the orchestrator is being re-invoked.
     AutoReplan {
         session_id: String,

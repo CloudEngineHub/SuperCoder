@@ -510,6 +510,50 @@ async fn relay_event(
             );
             false
         }
+        AgentEvent::AutoWorkerToolStart {
+            run_id,
+            worker_id,
+            tool_call_id,
+            tool_name,
+            args_summary,
+            ..
+        } => {
+            emit_or_log(
+                ctx.emitter.as_ref(),
+                "agent:auto_worker_tool_start",
+                serde_json::json!({
+                    "thread_id": tid,
+                    "run_id": run_id,
+                    "worker_id": worker_id,
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "args_summary": args_summary,
+                }),
+            );
+            false
+        }
+        AgentEvent::AutoWorkerToolEnd {
+            run_id,
+            worker_id,
+            tool_call_id,
+            success,
+            summary,
+            ..
+        } => {
+            emit_or_log(
+                ctx.emitter.as_ref(),
+                "agent:auto_worker_tool_end",
+                serde_json::json!({
+                    "thread_id": tid,
+                    "run_id": run_id,
+                    "worker_id": worker_id,
+                    "tool_call_id": tool_call_id,
+                    "success": success,
+                    "summary": summary,
+                }),
+            );
+            false
+        }
         AgentEvent::AutoReplan { run_id, reason, .. } => {
             emit_or_log(
                 ctx.emitter.as_ref(),

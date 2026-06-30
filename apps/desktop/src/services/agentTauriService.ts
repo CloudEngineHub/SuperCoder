@@ -1,6 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
   AgentDisplayMessage,
+  AutoRun,
+  AutoSettings,
   CheckpointSummary,
   ContextEngineSettings,
   ContextEngineStatus,
@@ -11,10 +13,12 @@ import type {
   CuratedModel,
   FetchedModel,
   ModelCapability,
+  ModelRef,
   ProviderConfig,
   ProvidersResponse,
   SelectionRole,
   SessionRow,
+  WorkerPoolEntry,
 } from '../types/agent';
 import type { Attachment } from '../types/chat';
 import type {
@@ -344,5 +348,51 @@ export const agentTauriService = {
 
   async readFileText(path: string): Promise<string | null> {
     return invoke<string | null>('read_file_text', { path });
+  },
+
+  // ── Auto mode (P4/P5) ──────────────────────────────────────────────────
+
+  async getAutoSettings(): Promise<AutoSettings> {
+    return invoke<AutoSettings>('agent_get_auto_settings');
+  },
+
+  /** Set the orchestrator model, or pass `null` to clear it. */
+  async setAutoOrchestratorModel(model: ModelRef | null): Promise<void> {
+    return invoke<void>('agent_set_auto_orchestrator_model', { model });
+  },
+
+  async setAutoWorkerPool(pool: WorkerPoolEntry[]): Promise<void> {
+    return invoke<void>('agent_set_auto_worker_pool', { pool });
+  },
+
+  /**
+   * Flip Auto on/off. Backend rejects:
+   * - ON without an orchestrator + non-empty worker pool
+   * - OFF while any session still has Auto as its active model
+   * The caller should `listSessionsUsingAuto` first when disabling so it
+   * can show the offending sessions to the user.
+   */
+  async setAutoEnabled(enabled: boolean): Promise<void> {
+    return invoke<void>('agent_set_auto_enabled', { enabled });
+  },
+
+  async listSessionsUsingAuto(): Promise<SessionRow[]> {
+    return invoke<SessionRow[]>('agent_list_sessions_using_auto');
+  },
+
+  /** Resolve a pending Auto plan approval (Run = true, Cancel = false). */
+  async approveAutoPlan(runId: string, approved: boolean): Promise<void> {
+    return invoke<void>('agent_approve_auto_plan', { runId, approved });
+  },
+
+  /** Resolve a paused-for-failure Auto run. action ∈ "retry" | "replan" | "cancel". */
+  async resolveWorkerFailure(runId: string, action: 'retry' | 'replan' | 'cancel'): Promise<void> {
+    return invoke<void>('agent_resolve_worker_failure', { runId, action });
+  },
+
+  /** Load a persisted AutoRun snapshot. Returns null if the run_id is
+   *  unknown (e.g. row was never written, or session/run was deleted). */
+  async getAutoRun(runId: string): Promise<AutoRun | null> {
+    return invoke<AutoRun | null>('agent_get_auto_run', { runId });
   },
 };

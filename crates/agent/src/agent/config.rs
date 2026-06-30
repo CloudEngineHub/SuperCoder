@@ -140,3 +140,20 @@ impl Default for RetryConfig {
         }
     }
 }
+
+impl RetryConfig {
+    /// Tight retry budget for Auto-mode workers. With the user-in-loop
+    /// failure flow (Retry / Replan / Cancel on every hard failure), the
+    /// internal retry budget should fail fast and surface to the user
+    /// instead of hammering an already-rate-limited provider for 7s+ on
+    /// every iteration. With 1 retry + 1s initial delay, a worker that
+    /// keeps 429-ing exits in ~1s per iteration instead of ~7s.
+    pub fn auto_worker() -> Self {
+        Self {
+            max_retries: 1,
+            initial_delay: Duration::from_secs(1),
+            multiplier: 2.0,
+            max_delay: Duration::from_secs(4),
+        }
+    }
+}

@@ -46,7 +46,8 @@ use crate::types::AgentEvent;
 
 use super::orchestrator::{generate_plan as orchestrator_generate_plan, OrchestratorError, OrchestratorRequest};
 use super::types::{
-    AutoResult, AutoRun, AutoStatus, Plan, WorkerPoolEntry, WorkerResult, WorkerSpec, WorkerStatus,
+    AutoResult, AutoRun, AutoStatus, Plan, WorkerFailureContext, WorkerPoolEntry, WorkerResult,
+    WorkerSpec, WorkerStatus,
 };
 use super::worker::{run_worker as live_run_worker, WorkerContext};
 
@@ -79,6 +80,18 @@ pub trait WorkerRunner: Send + Sync {
 pub trait PlanApprover: Send + Sync {
     /// Returns `true` to proceed, `false` to abort the task.
     async fn approve(&self, plan: &Plan) -> bool;
+}
+
+/// Fire-and-forget hook called by the executor whenever `auto_run`'s state
+/// changes meaningfully (plan added, worker finished, replan, status flip).
+/// The production impl persists the snapshot to the `auto_runs` table so a
+/// page reload or app restart sees the latest known state — without it, the
+/// row stays frozen at the initial `Planning` until the run terminates.
+///
+/// Sync by design — the executor never awaits on persistence. Impls that
+/// need IO should spawn their own task.
+pub trait AutoStateListener: Send + Sync {
+    fn on_state(&self, run: &AutoRun);
 }
 
 // ── Production-ready impls ───────────────────────────────────────────────
@@ -133,6 +146,24 @@ pub struct ExecutorConfig {
     /// Max reactive replans after the initial plan. Total orchestrator calls
     /// per task = 1 + replan_budget. 0 = strict single-shot.
     pub replan_budget: u32,
+    /// When `Some`, the executor resumes from this saved snapshot instead
+    /// of starting fresh: `plan_versions.last()` becomes the first plan
+    /// (orchestrator NOT called for that iteration). Replans inside the
+    /// resumed run still go through the orchestrator normally. Used by the
+    /// "Resume" button on the failed-run banner when the prior executor
+    /// task was killed (app restart, crash) before user approval.
+    pub resume_from: Option<AutoRun>,
+    /// P9c: when set, the worker loop starts execution at the named worker
+    /// instead of `plan.workers[0]`. Used by the user-driven Retry path
+    /// after a hard worker failure: the prior workers already ran (their
+    /// results are restored from `resume_from`), only the failed one and
+    /// any subsequent workers need to run.
+    pub start_at_worker_id: Option<String>,
+    /// P9c: when set, the executor treats its first iteration as a replan —
+    /// invokes the orchestrator with this reason in the prompt (instead of
+    /// the saved plan). Used by the user-driven Replan path after a hard
+    /// worker failure. Mutually exclusive with `start_at_worker_id`.
+    pub initial_replan_reason: Option<String>,
 }
 
 // ── Main entry ───────────────────────────────────────────────────────────
@@ -149,70 +180,153 @@ pub async fn run(
     worker_runner: Arc<dyn WorkerRunner>,
     approver: Arc<dyn PlanApprover>,
     cancel: CancellationToken,
+    state_listener: Option<Arc<dyn AutoStateListener>>,
 ) -> AutoResult {
-    let mut auto_run = AutoRun {
-        id: config.auto_run_id.clone(),
-        session_id: config.session_id.clone(),
-        status: AutoStatus::Planning,
-        plan_versions: Vec::new(),
-        worker_results: Vec::new(),
-        cost_cents: 0,
-        replans_used: 0,
+    // Resume path: seed the in-memory state from the saved snapshot so the
+    // executor's view of plan_versions / worker_results / replans_used
+    // matches what's on disk. The orchestrator is short-circuited on the
+    // first loop iteration (see `resume_plan` below) — replans behave
+    // normally from there.
+    // P9c: ReplanAfterFailure forces a fresh orchestrator call (the saved
+    // plan is NOT reused; the failure reason is fed in as replan context).
+    // Mutually exclusive with RetryWorker.
+    let force_replan_on_first_iter = config.initial_replan_reason.is_some();
+    let (mut auto_run, mut resume_plan, mut current_version) = match config.resume_from.clone() {
+        Some(snap) => {
+            // current_version is "the version of the plan we're about to
+            // run". For a resume from awaiting_approval the snapshot has
+            // exactly that plan as its latest entry, so we re-use that
+            // version number (don't increment) — unless we're replanning
+            // after failure, in which case the next plan is a new version.
+            let v_existing = snap.plan_versions.last().map(|p| p.version).unwrap_or(1);
+            if force_replan_on_first_iter {
+                (snap, None, v_existing + 1)
+            } else {
+                let initial = snap.plan_versions.last().cloned();
+                (snap, initial, v_existing)
+            }
+        }
+        None => (
+            AutoRun {
+                id: config.auto_run_id.clone(),
+                session_id: config.session_id.clone(),
+                status: AutoStatus::Planning,
+                plan_versions: Vec::new(),
+                worker_results: Vec::new(),
+                cost_cents: 0,
+                replans_used: 0,
+                current_worker: None,
+                pending_failure: None,
+            },
+            None,
+            1u32,
+        ),
     };
 
-    let mut prior_results: Vec<WorkerResult> = Vec::new();
-    let mut current_version: u32 = 1;
-    let mut replan_reason: Option<String> = None;
+    // Notify the listener (if any) of every state mutation. Used by the
+    // Tauri layer to flush incremental snapshots to `auto_runs` so a reload
+    // mid-flight reads the latest known state instead of the initial row.
+    let notify = |run: &AutoRun| {
+        if let Some(l) = &state_listener {
+            l.on_state(run);
+        }
+    };
+
+    // Restore prior worker outputs so already-completed workers are still
+    // visible to subsequent workers' `see_prior` and to the orchestrator on
+    // any future replan. Empty on a fresh run; non-empty on resume.
+    let mut prior_results: Vec<WorkerResult> = auto_run.worker_results.clone();
+    // P9c: clear any prior pending_failure on resume — the user has chosen
+    // an action (Retry/Replan) by spawning us, so the failure is being
+    // addressed and shouldn't appear in the snapshot anymore.
+    auto_run.pending_failure = None;
+    // P9c: ReplanAfterFailure seeds the replan_reason so the orchestrator
+    // call on iteration 1 includes the failure context.
+    let mut replan_reason: Option<String> = config.initial_replan_reason.clone();
+    // P9c: RetryWorker: skip earlier workers in the saved plan that
+    // already completed. Only the named worker and subsequent ones run.
+    // Cleared (via Option::take) after the first iteration uses it so any
+    // subsequent replan iteration starts at index 0 of the new plan.
+    let mut start_at_worker_id: Option<String> = config.start_at_worker_id.clone();
 
     loop {
         // ── 1. Planning ──
-        emit(
-            &event_tx,
-            AgentEvent::AutoPlanning {
-                session_id: config.session_id.clone(),
-                run_id: config.auto_run_id.clone(),
-            },
-        )
-        .await;
-        auto_run.status = AutoStatus::Planning;
+        // Resume short-circuit: take the saved plan instead of calling the
+        // orchestrator. It's already in plan_versions on the snapshot, so
+        // don't re-push. Still emit AutoPlan so the frontend's live
+        // reducer matches the hydrated state. After this iteration
+        // resume_plan is None and the loop falls back to normal planning.
+        let plan = if let Some(p) = resume_plan.take() {
+            log::info!(
+                "[Auto-P7] executor resuming from saved plan v{} ({} workers); skipping orchestrator",
+                p.version,
+                p.workers.len(),
+            );
+            emit(
+                &event_tx,
+                AgentEvent::AutoPlan {
+                    session_id: config.session_id.clone(),
+                    run_id: config.auto_run_id.clone(),
+                    version: p.version,
+                    reasoning: p.reasoning.clone(),
+                    plan: p.workers.clone(),
+                },
+            )
+            .await;
+            p
+        } else {
+            emit(
+                &event_tx,
+                AgentEvent::AutoPlanning {
+                    session_id: config.session_id.clone(),
+                    run_id: config.auto_run_id.clone(),
+                },
+            )
+            .await;
+            auto_run.status = AutoStatus::Planning;
+            notify(&auto_run);
 
-        if cancel.is_cancelled() {
-            return finalize_cancelled(auto_run);
-        }
-
-        let req = OrchestratorRequest {
-            task: &config.task,
-            worker_pool: &config.worker_pool,
-            prior_results: &prior_results,
-            replan_reason: replan_reason.as_deref(),
-            plan_version: current_version,
-        };
-
-        let plan = match plan_gen.generate(&req, Some(&cancel)).await {
-            Ok(p) => p,
-            Err(OrchestratorError::Cancelled) => return finalize_cancelled(auto_run),
-            Err(e) => {
-                let reason = format!("orchestrator error: {e}");
-                return finalize_failed(auto_run, &event_tx, &config, reason, None).await;
+            if cancel.is_cancelled() {
+                return finalize_cancelled(auto_run, &notify);
             }
-        };
 
-        auto_run.plan_versions.push(plan.clone());
-        emit(
-            &event_tx,
-            AgentEvent::AutoPlan {
-                session_id: config.session_id.clone(),
-                run_id: config.auto_run_id.clone(),
-                version: plan.version,
-                reasoning: plan.reasoning.clone(),
-                plan: plan.workers.clone(),
-            },
-        )
-        .await;
+            let req = OrchestratorRequest {
+                task: &config.task,
+                worker_pool: &config.worker_pool,
+                prior_results: &prior_results,
+                replan_reason: replan_reason.as_deref(),
+                plan_version: current_version,
+            };
+
+            let p = match plan_gen.generate(&req, Some(&cancel)).await {
+                Ok(p) => p,
+                Err(OrchestratorError::Cancelled) => return finalize_cancelled(auto_run, &notify),
+                Err(e) => {
+                    let reason = format!("orchestrator error: {e}");
+                    return finalize_failed(auto_run, &event_tx, &config, reason, None, &notify).await;
+                }
+            };
+
+            auto_run.plan_versions.push(p.clone());
+            notify(&auto_run);
+            emit(
+                &event_tx,
+                AgentEvent::AutoPlan {
+                    session_id: config.session_id.clone(),
+                    run_id: config.auto_run_id.clone(),
+                    version: p.version,
+                    reasoning: p.reasoning.clone(),
+                    plan: p.workers.clone(),
+                },
+            )
+            .await;
+            p
+        };
 
         // ── 2. Approval (initial plan only; replans auto-proceed) ──
         if current_version == 1 {
             auto_run.status = AutoStatus::AwaitingApproval;
+            notify(&auto_run);
             emit(
                 &event_tx,
                 AgentEvent::AutoAwaitingApproval {
@@ -224,42 +338,70 @@ pub async fn run(
 
             let approved = tokio::select! {
                 a = approver.approve(&plan) => a,
-                _ = cancel.cancelled() => return finalize_cancelled(auto_run),
+                _ = cancel.cancelled() => return finalize_cancelled(auto_run, &notify),
             };
             if !approved {
                 let reason = "plan rejected by user".to_string();
-                return finalize_failed(auto_run, &event_tx, &config, reason, None).await;
+                return finalize_failed(auto_run, &event_tx, &config, reason, None, &notify).await;
             }
         }
 
         // ── 3. Sequential worker execution ──
         auto_run.status = AutoStatus::Running;
-        let mut hard_failure: Option<String> = None;
+        notify(&auto_run);
+        let mut hard_failure_pending: Option<WorkerFailureContext> = None;
         let mut last_summary: Option<String> = None;
 
-        for spec in plan.workers.iter() {
+        // P9c: RetryWorker resume — skip past workers that already
+        // completed; start at the one the user asked to retry. Only applies
+        // on the first plan iteration; subsequent replans always start at
+        // index 0 of the new plan (Option::take clears the binding).
+        let start_idx = if let Some(target_id) = start_at_worker_id.take() {
+            plan.workers.iter().position(|w| w.id == target_id).unwrap_or(0)
+        } else {
+            0
+        };
+
+        for spec in plan.workers.iter().skip(start_idx) {
             if cancel.is_cancelled() {
-                return finalize_cancelled(auto_run);
+                return finalize_cancelled(auto_run, &notify);
             }
+
+            // Mark this worker as in flight BEFORE we block on its execution
+            // so a reload during the (potentially long) worker run shows
+            // "Running: wN (model)" instead of just "status: running".
+            auto_run.current_worker = Some(spec.clone());
+            notify(&auto_run);
 
             let result = worker_runner.run(spec, &prior_results).await;
             last_summary = Some(result.summary.clone());
             auto_run.cost_cents = auto_run.cost_cents.saturating_add(result.cost_cents);
+            // Worker is no longer in flight; clear before pushing the result
+            // so the next persisted snapshot is internally consistent.
+            auto_run.current_worker = None;
 
             if result.status == WorkerStatus::Cancelled {
                 auto_run.worker_results.push(result);
-                return finalize_cancelled(auto_run);
+                return finalize_cancelled(auto_run, &notify);
             }
 
             if result.status.is_hard_failure() {
-                hard_failure = Some(format!(
-                    "worker {} ({}) failed [{}]: {}",
-                    spec.id,
-                    spec.model,
-                    status_label(&result.status),
-                    truncate(&result.summary, 240),
-                ));
-                auto_run.worker_results.push(result);
+                // P9c: capture the failure context for the panel's user-driven
+                // recovery banner instead of recording the partial result in
+                // the ledger. The Tauri side spawns a fresh executor with the
+                // user's choice (Retry / Replan / Cancel).
+                hard_failure_pending = Some(WorkerFailureContext {
+                    worker_id: spec.id.clone(),
+                    worker_model: spec.model.clone(),
+                    worker_prompt: spec.prompt.clone(),
+                    error_message: format!(
+                        "worker {} ({}) failed [{}]: {}",
+                        spec.id,
+                        spec.model,
+                        status_label(&result.status),
+                        truncate(&result.summary, 240),
+                    ),
+                });
                 break;
             }
 
@@ -268,20 +410,33 @@ pub async fn run(
             // (the persisted ledger).
             prior_results.push(result.clone());
             auto_run.worker_results.push(result);
+            notify(&auto_run);
         }
 
         // ── 4. Terminal or replan? ──
-        match hard_failure {
+        match hard_failure_pending {
             None => {
                 // All workers in this plan ran successfully.
-                return finalize_done(auto_run, &event_tx, &config, last_summary).await;
+                return finalize_done(auto_run, &event_tx, &config, last_summary, &notify).await;
             }
-            Some(reason) => {
+            Some(ctx) => {
+                // P9c: replan_budget defaults to 0 in production (auto.rs
+                // sets AUTO_REPLAN_BUDGET=0). The user becomes the budget —
+                // pause the run by stamping pending_failure + status
+                // AwaitingFailureDecision into the snapshot. The Tauri side
+                // surfaces a Retry/Replan/Cancel banner and spawns a fresh
+                // executor on the user's choice. Tests can still pass a
+                // nonzero replan_budget to exercise the auto-replan path.
                 if auto_run.replans_used >= config.replan_budget {
-                    return finalize_failed(auto_run, &event_tx, &config, reason, last_summary).await;
+                    return finalize_awaiting_failure_decision(
+                        auto_run, &event_tx, &config, ctx, &notify,
+                    )
+                    .await;
                 }
+                let reason = ctx.error_message.clone();
                 auto_run.replans_used += 1;
                 current_version += 1;
+                notify(&auto_run);
                 emit(
                     &event_tx,
                     AgentEvent::AutoReplan {
@@ -298,6 +453,38 @@ pub async fn run(
     }
 }
 
+/// P9c: terminate the run as "Failed" but tag it with `pending_failure` and
+/// `status = AwaitingFailureDecision`. The frontend renders this as a
+/// recoverable failure (Retry / Replan / Cancel banner); the user's choice
+/// spawns a fresh executor via `agent_resolve_worker_failure`.
+async fn finalize_awaiting_failure_decision(
+    mut run: AutoRun,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    config: &ExecutorConfig,
+    failure: WorkerFailureContext,
+    notify: &(dyn Fn(&AutoRun) + Send + Sync),
+) -> AutoResult {
+    let reason = failure.error_message.clone();
+    run.status = AutoStatus::AwaitingFailureDecision;
+    run.pending_failure = Some(failure);
+    notify(&run);
+    // Reuse the existing AutoFailed event channel — the frontend will read
+    // the snapshot's `pending_failure` field via hydration to know it's
+    // user-recoverable (vs. a terminally-Failed run). Avoids adding yet
+    // another event variant + 4-tier UI dispatch.
+    emit(
+        event_tx,
+        AgentEvent::AutoFailed {
+            session_id: config.session_id.clone(),
+            run_id: config.auto_run_id.clone(),
+            reason: reason.clone(),
+            last_worker_output: None,
+        },
+    )
+    .await;
+    AutoResult::Failed { reason, run }
+}
+
 // ── Finalizers ───────────────────────────────────────────────────────────
 
 async fn finalize_done(
@@ -305,8 +492,10 @@ async fn finalize_done(
     event_tx: &mpsc::Sender<AgentEvent>,
     config: &ExecutorConfig,
     summary_hint: Option<String>,
+    notify: &(dyn Fn(&AutoRun) + Send + Sync),
 ) -> AutoResult {
     run.status = AutoStatus::Done;
+    notify(&run);
     let summary = summary_hint.unwrap_or_else(|| "Auto task complete.".to_string());
     emit(
         event_tx,
@@ -327,8 +516,10 @@ async fn finalize_failed(
     config: &ExecutorConfig,
     reason: String,
     last_worker_output: Option<String>,
+    notify: &(dyn Fn(&AutoRun) + Send + Sync),
 ) -> AutoResult {
     run.status = AutoStatus::Failed;
+    notify(&run);
     emit(
         event_tx,
         AgentEvent::AutoFailed {
@@ -342,8 +533,9 @@ async fn finalize_failed(
     AutoResult::Failed { reason, run }
 }
 
-fn finalize_cancelled(mut run: AutoRun) -> AutoResult {
+fn finalize_cancelled(mut run: AutoRun, notify: &dyn Fn(&AutoRun)) -> AutoResult {
     run.status = AutoStatus::Cancelled;
+    notify(&run);
     // No AgentEvent::AutoCancelled in the enum; the UI infers cancel from the
     // user's Cancel click. We could re-purpose AutoFailed with reason
     // "cancelled" if downstream surfaces need an explicit signal — for now,
@@ -527,6 +719,9 @@ mod tests {
                     description: "the only worker".into(),
                 }],
                 replan_budget,
+                resume_from: None,
+                start_at_worker_id: None,
+                initial_replan_reason: None,
             },
             tx,
             rx,
@@ -566,6 +761,7 @@ mod tests {
             runner.clone(),
             Arc::new(AutoApprove),
             CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -620,6 +816,7 @@ mod tests {
             runner.clone(),
             Arc::new(AutoApprove),
             CancellationToken::new(),
+            None,
         )
         .await;
         let events = drain(rx).await;
@@ -637,7 +834,10 @@ mod tests {
         };
         assert_eq!(auto_run.replans_used, 1);
         assert_eq!(auto_run.plan_versions.len(), 2);
-        assert_eq!(auto_run.worker_results.len(), 3); // w1 ok, w2 failed, w2_retry ok
+        // P9c: failed worker results are no longer pushed into worker_results
+        // (they live in pending_failure context instead). After a successful
+        // replan the ledger contains only the OK workers: w1 + w2_retry.
+        assert_eq!(auto_run.worker_results.len(), 2);
 
         assert!(events.iter().any(|e| matches!(e, AgentEvent::AutoReplan { .. })));
     }
@@ -664,6 +864,7 @@ mod tests {
             runner,
             Arc::new(AutoApprove),
             CancellationToken::new(),
+            None,
         )
         .await;
         let events = drain(rx).await;
@@ -673,7 +874,11 @@ mod tests {
                 assert!(reason.contains("w1_retry"), "reason should mention the last failed worker: {reason}");
                 assert_eq!(run.replans_used, 1, "budget=1 means exactly 1 replan attempted");
                 assert_eq!(run.plan_versions.len(), 2);
-                assert_eq!(run.status, AutoStatus::Failed);
+                // P9c: budget exhaustion now parks the run in
+                // AwaitingFailureDecision with pending_failure set so the
+                // user can pick Retry / Replan / Cancel from the panel.
+                assert_eq!(run.status, AutoStatus::AwaitingFailureDecision);
+                assert!(run.pending_failure.is_some(), "pending_failure must be populated for user recovery");
             }
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -687,13 +892,16 @@ mod tests {
         runner.enqueue("w1", worker_fail("w1", WorkerStatus::LlmError { message: "5xx".into() }));
 
         let (config, tx, rx) = cfg(0);
-        let result = run(config, tx, plan_gen, runner, Arc::new(AutoApprove), CancellationToken::new()).await;
+        let result = run(config, tx, plan_gen, runner, Arc::new(AutoApprove), CancellationToken::new(), None).await;
         let _ = drain(rx).await;
 
         match result {
             AutoResult::Failed { run, .. } => {
                 assert_eq!(run.replans_used, 0);
                 assert_eq!(run.plan_versions.len(), 1);
+                // P9c: budget=0 path also parks in AwaitingFailureDecision now.
+                assert_eq!(run.status, AutoStatus::AwaitingFailureDecision);
+                assert!(run.pending_failure.is_some());
             }
             other => panic!("expected immediate Failed with budget=0, got {other:?}"),
         }
@@ -705,7 +913,7 @@ mod tests {
         let runner = Arc::new(MockRunner::new());
 
         let (config, tx, rx) = cfg(2);
-        let result = run(config, tx, plan_gen, runner.clone(), Arc::new(AlwaysReject), CancellationToken::new()).await;
+        let result = run(config, tx, plan_gen, runner.clone(), Arc::new(AlwaysReject), CancellationToken::new(), None).await;
         let events = drain(rx).await;
 
         match result {
@@ -729,7 +937,7 @@ mod tests {
         let runner = Arc::new(MockRunner::new());
 
         let (config, tx, rx) = cfg(2);
-        let result = run(config, tx, plan_gen, runner.clone(), Arc::new(AutoApprove), CancellationToken::new()).await;
+        let result = run(config, tx, plan_gen, runner.clone(), Arc::new(AutoApprove), CancellationToken::new(), None).await;
         let _ = drain(rx).await;
 
         match result {
@@ -752,7 +960,7 @@ mod tests {
         runner.enqueue("w1", worker_fail("w1", WorkerStatus::Cancelled));
 
         let (config, tx, _rx) = cfg(2);
-        let result = run(config, tx, plan_gen, runner.clone(), Arc::new(AutoApprove), CancellationToken::new()).await;
+        let result = run(config, tx, plan_gen, runner.clone(), Arc::new(AutoApprove), CancellationToken::new(), None).await;
 
         match result {
             AutoResult::Cancelled { run } => {
@@ -772,7 +980,7 @@ mod tests {
         let (config, tx, _rx) = cfg(2);
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let result = run(config, tx, plan_gen.clone(), runner.clone(), Arc::new(AutoApprove), cancel).await;
+        let result = run(config, tx, plan_gen.clone(), runner.clone(), Arc::new(AutoApprove), cancel, None).await;
 
         match result {
             AutoResult::Cancelled { run } => {

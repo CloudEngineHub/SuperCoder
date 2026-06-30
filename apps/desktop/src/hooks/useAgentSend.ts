@@ -67,6 +67,20 @@ export function useAgentSend({ sessionId }: UseAgentSendOpts): UseAgentSendRetur
     try {
       await agentTauriService.cancelSession(loopId);
 
+      // Auto runs render their own inline panel that flips to a Failed
+      // banner once the backend's synthetic AutoFailed event arrives —
+      // adding the generic "Session interrupted" bubble would duplicate
+      // the signal, so we skip it for Auto sessions.
+      const inAutoRun = Object.values(store.autoRuns).some(
+        (r) =>
+          r.sessionId === sessionId &&
+          (r.status === "planning" ||
+            r.status === "awaiting_approval" ||
+            r.status === "running" ||
+            r.status === "replanning" ||
+            r.status === "awaiting_failure_decision"),
+      );
+
       const streaming = store.agentStreaming[sessionId];
       if (streaming?.textBuffer) {
         store.addMessageToThread(
@@ -74,10 +88,12 @@ export function useAgentSend({ sessionId }: UseAgentSendOpts): UseAgentSendRetur
           buildAgentMessage(`agent-stopped-${Date.now()}`, streaming.textBuffer, "agent", sessionId, ""),
         );
       }
-      store.addMessageToThread(
-        sessionId,
-        buildAgentMessage(`interrupted-${Date.now()}`, "Session interrupted by user", "agent", sessionId, ""),
-      );
+      if (!inAutoRun) {
+        store.addMessageToThread(
+          sessionId,
+          buildAgentMessage(`interrupted-${Date.now()}`, "Session interrupted by user", "agent", sessionId, ""),
+        );
+      }
       store.clearAgentStreaming(sessionId);
       store.clearActiveSession(sessionId);
     } catch (err) {

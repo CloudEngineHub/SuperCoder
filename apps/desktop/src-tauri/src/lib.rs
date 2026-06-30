@@ -575,6 +575,14 @@ pub fn run() {
             let data_dir = app_data_dir();
             let agent_db = agent_bridge::db::AgentDb::new(&data_dir)
                 .expect("Failed to create agent database");
+            // Reap zombie Auto runs from a previous app session — any
+            // non-terminal row at startup has no live executor and would
+            // hydrate the panel into a spinning-forever state.
+            match agent_db.mark_zombie_auto_runs_failed() {
+                Ok(0) => {}
+                Ok(n) => log::info!("[Auto-P7] reaped {n} zombie auto_runs at startup"),
+                Err(e) => log::warn!("[Auto-P7] zombie auto_runs cleanup failed: {e}"),
+            }
             let agent_db_arc = Arc::new(agent_db);
 
             let checkpoint_root = data_dir.join("checkpoints");
@@ -649,10 +657,11 @@ pub fn run() {
             agent_bridge::auto::agent_get_auto_settings,
             agent_bridge::auto::agent_set_auto_orchestrator_model,
             agent_bridge::auto::agent_set_auto_worker_pool,
-            agent_bridge::auto::agent_set_auto_replan_budget,
             agent_bridge::auto::agent_set_auto_enabled,
             agent_bridge::auto::agent_list_sessions_using_auto,
             agent_bridge::auto::agent_approve_auto_plan,
+            agent_bridge::auto::agent_resolve_worker_failure,
+            agent_bridge::auto::agent_get_auto_run,
             agent_bridge::commands::agent_get_context_engine,
             agent_bridge::commands::agent_set_context_engine,
             agent_bridge::commands::agent_context_engine_status,

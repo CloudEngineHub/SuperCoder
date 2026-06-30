@@ -7,6 +7,7 @@ import ArtifactRenderer from "../artifacts/ArtifactRenderer";
 import AgentInput from "../AgentInput/AgentInput";
 import ApprovalBanner from "./ApprovalBanner";
 import QuestionBanner from "./QuestionBanner";
+import AutoRunPanel from "@/components/auto/AutoRunPanel";
 import TodoProgress from "./TodoProgress";
 import PlanBanner from "./PlanBanner";
 import RewindEditor from "./RewindEditor";
@@ -38,6 +39,21 @@ export default function AgentThreadPanel() {
 
   const streaming = useAppStore((s) => (activeAgentThreadId ? s.agentStreaming[activeAgentThreadId] : null));
   const isLoadingThread = useAppStore((s) => (activeAgentThreadId ? !!s.agentThreadLoading[activeAgentThreadId] : false));
+  // True iff any Auto run for this session is in flight — used to suppress
+  // the generic "Thinking…" placeholder, since the inline AutoRunPanel
+  // already shows live progress.
+  const hasInFlightAutoRun = useAppStore((s) =>
+    activeAgentThreadId
+      ? Object.values(s.autoRuns).some(
+          (r) =>
+            r.sessionId === activeAgentThreadId &&
+            (r.status === 'planning' ||
+              r.status === 'awaiting_approval' ||
+              r.status === 'running' ||
+              r.status === 'replanning'),
+        )
+      : false,
+  );
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const thread = activeAgentThreadId ? agentThreads[activeAgentThreadId] : null;
@@ -250,6 +266,16 @@ export default function AgentThreadPanel() {
           const isUserMsg = msg.role === "user";
           const canRewind = isUserMsg && !streaming?.isStreaming && !isRewindingRef.current && Number.isFinite(Number(msg.id));
 
+          // Auto-mode anchor row: swap the bubble for the inline panel,
+          // keyed by the auto_run_id carried on the persisted row.
+          if (msg.role === "agent" && msg.auto_run_id) {
+            return (
+              <div key={msg.id} className={styles.message_group}>
+                <AutoRunPanel runId={msg.auto_run_id} />
+              </div>
+            );
+          }
+
           return (
             <div key={msg.id} className={styles.message_group}>
               {isEditing ? (
@@ -302,7 +328,7 @@ export default function AgentThreadPanel() {
           </div>
         )}
 
-        {streaming?.isStreaming && !streaming.textBuffer && (() => {
+        {streaming?.isStreaming && !streaming.textBuffer && !hasInFlightAutoRun && (() => {
           const runningSubagent = streaming.toolCalls.find(
             (tc) => tc.status === "running" && tc.toolName.toLowerCase().startsWith("subagent:"),
           );

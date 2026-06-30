@@ -1,11 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Input, Button, Select, Spin, Popconfirm, Switch, Segmented } from "antd";
-import { ArrowLeft, Plus, Pencil, Trash2, Sun, Moon, Monitor } from "lucide-react";
+import {
+  ArrowLeft,
+  Plus,
+  Pencil,
+  Trash2,
+  Sun,
+  Moon,
+  Monitor,
+  Palette,
+  Plug,
+  Layers,
+  Search,
+  Sparkles,
+} from "lucide-react";
 import { agentTauriService } from "@/services/agentTauriService";
 import { useAppStore } from "@/store";
 import { themedMessage } from "@/providers/AntDThemeProvider";
 import { useTheme, type ThemeMode } from "@/context/ThemeContext";
+import AutoSettingsSection from "@/components/auto/AutoSettingsSection";
 import type {
   ContextEngineSettings,
   ContextEngineStatus,
@@ -23,6 +37,27 @@ const DEFAULT_BASE_URL: Record<string, string> = {
   anthropic: "https://api.anthropic.com",
   openai_compatible: "",
 };
+
+type SettingsSection =
+  | "appearance"
+  | "providers"
+  | "background"
+  | "semantic"
+  | "auto";
+
+interface SettingsNavEntry {
+  id: SettingsSection;
+  label: string;
+  icon: React.ReactNode;
+}
+
+const SETTINGS_NAV: SettingsNavEntry[] = [
+  { id: "appearance", label: "Appearance", icon: <Palette className="w-4 h-4" /> },
+  { id: "providers", label: "LLM Providers", icon: <Plug className="w-4 h-4" /> },
+  { id: "background", label: "Background models", icon: <Layers className="w-4 h-4" /> },
+  { id: "semantic", label: "Semantic search", icon: <Search className="w-4 h-4" /> },
+  { id: "auto", label: "Auto", icon: <Sparkles className="w-4 h-4" /> },
+];
 
 /** Format a context window as a compact label, e.g. 1_000_000 → "1M", 128_000 → "128k". */
 function formatContext(tokens: number): string {
@@ -60,6 +95,7 @@ export default function Settings() {
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [selection, setSelection] = useState<ModelSelection>({ active: null, compaction: null, title: null });
   const [loading, setLoading] = useState(true);
+  const [activeSection, setActiveSection] = useState<SettingsSection>("appearance");
   const [saving, setSaving] = useState(false);
   // Provider being added/edited (null = list view).
   const [draft, setDraft] = useState<ProviderConfig | null>(null);
@@ -486,16 +522,43 @@ export default function Settings() {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="max-w-2xl mx-auto px-6 py-8">
+    <div className="flex-1 overflow-hidden flex">
+      {/* ── Left nav: section list ────────────────────────────────────── */}
+      <aside className="w-56 shrink-0 border-r border-[var(--border)] p-3 flex flex-col gap-1 overflow-y-auto">
         <button
           onClick={() => navigate("/")}
-          className="flex items-center gap-2 text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)] mb-6"
+          className="flex items-center gap-2 px-3 py-2 text-sm text-[var(--text-secondary)] hover:text-[var(--text-primary)] rounded-md mb-2"
         >
           <ArrowLeft className="w-4 h-4" /> Back
         </button>
+        <div className="text-[11px] uppercase tracking-wider text-[var(--text-secondary)] px-3 mb-1">
+          Settings
+        </div>
+        {SETTINGS_NAV.map((entry) => {
+          const active = activeSection === entry.id;
+          return (
+            <button
+              key={entry.id}
+              onClick={() => setActiveSection(entry.id)}
+              className={`flex items-center gap-2 px-3 py-2 text-sm rounded-md text-left transition-colors ${
+                active
+                  ? "bg-[var(--bg-secondary)] text-[var(--text-primary)] font-medium"
+                  : "text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)] hover:text-[var(--text-primary)]"
+              }`}
+            >
+              {entry.icon}
+              {entry.label}
+            </button>
+          );
+        })}
+      </aside>
+
+      {/* ── Right pane: active section's UI ───────────────────────────── */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-2xl mx-auto px-6 py-8">
 
         {/* Appearance */}
+        {activeSection === "appearance" && (<>
         <h2 className="text-base font-semibold text-[var(--text-primary)] mb-1">Appearance</h2>
         <p className="text-sm text-[var(--text-secondary)] mb-3">
           Choose the theme. System follows your OS appearance.
@@ -510,7 +573,10 @@ export default function Settings() {
             { label: <span className="flex items-center gap-1.5"><Monitor size={14} /> System</span>, value: "system" },
           ]}
         />
+        </>)}
 
+        {/* LLM Providers */}
+        {activeSection === "providers" && (<>
         <h1 className="text-xl font-semibold text-[var(--text-primary)] mb-1">LLM Providers</h1>
         <p className="text-sm text-[var(--text-secondary)] mb-6">
           Set the API key + base URL for each provider and fetch its models. Pick the coding model from
@@ -652,11 +718,15 @@ export default function Settings() {
                 </div>
               ))}
             </div>
+          </>
+        )}
             <Button icon={<Plus className="w-4 h-4" />} onClick={startAddCompatible} className="mb-8">
               Add OpenAI-compatible provider
             </Button>
+        </>)}
 
-            {/* Background models (global) */}
+        {/* Background models (global) */}
+        {activeSection === "background" && (<>
             <h2 className="text-base font-semibold text-[var(--text-primary)] mb-1">Background models</h2>
             <p className="text-sm text-[var(--text-secondary)] mb-4">
               Cheap models used automatically — picked from any configured provider.
@@ -688,7 +758,10 @@ export default function Settings() {
               </div>
             </div>
 
-            {/* Context engine (opt-in semantic + graph search) */}
+        </>)}
+
+        {/* Context engine (opt-in semantic + graph search) */}
+        {activeSection === "semantic" && (<>
             <div className="flex items-center justify-between mt-8 mb-1">
               <h2 className="text-base font-semibold text-[var(--text-primary)]">
                 Semantic search
@@ -884,8 +957,12 @@ export default function Settings() {
                 </div>
               </div>
             )}
-          </>
-        )}
+        </>)}
+
+        {/* Auto mode — opt-in multi-model orchestration. */}
+        {activeSection === "auto" && <AutoSettingsSection />}
+
+        </div>
       </div>
     </div>
   );

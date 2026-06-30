@@ -718,7 +718,7 @@ mod tests {
     fn cache_control_on_last_tool_only() {
         let tool = |n: &str| ToolDefinition {
             type_: "function".into(),
-            function: FunctionDefinition { name: n.into(), description: None, parameters: None },
+            function: FunctionDefinition { name: n.into(), description: None, parameters: None, strict: None },
             cache_control: None,
         };
         let req = build_anthropic_request(&[user("hi")], &[tool("a"), tool("b")], &cfg());

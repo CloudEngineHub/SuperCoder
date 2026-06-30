@@ -17,8 +17,8 @@ pub mod types;
 pub mod worker;
 
 pub use executor::{
-    run as run_auto, AutoApprove, ExecutorConfig, LiveWorkerRunner, LlmPlanGenerator,
-    PlanApprover, PlanGenerator, WorkerRunner,
+    run as run_auto, AutoApprove, AutoStateListener, ExecutorConfig, LiveWorkerRunner,
+    LlmPlanGenerator, PlanApprover, PlanGenerator, WorkerRunner,
 };
 pub use orchestrator::{
     build_orchestrator_messages, generate_plan, parse_plan_from_tool_input, OrchestratorError,
@@ -26,7 +26,7 @@ pub use orchestrator::{
 };
 pub use schema::{submit_plan_input_schema, submit_plan_tool, SUBMIT_PLAN_TOOL_NAME};
 pub use types::{
-    AutoResult, AutoRun, AutoStatus, Plan, SeePrior, SeePriorKeyword, WorkerPoolEntry,
-    WorkerResult, WorkerSpec, WorkerStatus,
+    AutoResult, AutoRun, AutoStatus, Plan, SeePrior, SeePriorKeyword, WorkerFailureContext,
+    WorkerPoolEntry, WorkerResult, WorkerSpec, WorkerStatus,
 };
 pub use worker::{run_worker, WorkerContext};

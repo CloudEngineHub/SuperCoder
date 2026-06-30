@@ -41,6 +41,11 @@ pub struct AgentState {
     /// inserts a `oneshot::Sender<bool>` keyed by `run_id`;
     /// `agent_approve_auto_plan` drains it. See `agent_bridge::auto`.
     pub(crate) auto_plan_pending: crate::agent_bridge::auto::AutoApprovalPending,
+    /// Cancellation tokens for in-flight Auto runs, keyed by `session_id`.
+    /// `run_auto_turn` inserts when spawning the executor and removes on
+    /// completion; `agent_cancel_session` triggers it so the stop button
+    /// reaches the executor.
+    pub(crate) auto_cancellation: crate::agent_bridge::auto::AutoCancelRegistry,
 }
 
 impl AgentState {
@@ -54,6 +59,7 @@ impl AgentState {
             model_registry: RwLock::new(agent::agent::model_profile::ModelRegistry::with_defaults()),
             write_lock_registry: Arc::new(agent::subagents::WriteLockRegistry::new()),
             auto_plan_pending: crate::agent_bridge::auto::new_pending_map(),
+            auto_cancellation: crate::agent_bridge::auto::new_cancel_registry(),
         }
     }
 
@@ -373,13 +379,13 @@ pub(crate) fn read_context_engine_db(db: &crate::Database) -> ContextEngineSetti
         .unwrap_or_default()
 }
 
-fn read_context_engine(app_state: &AppState) -> ContextEngineSettings {
+pub(crate) fn read_context_engine(app_state: &AppState) -> ContextEngineSettings {
     read_context_engine_db(&app_state.db)
 }
 
 /// Stable per-machine UUID for context-engine tenancy headers. Generated and
 /// persisted to the settings DB on first use (no accounts in v1).
-fn machine_id(app_state: &AppState) -> String {
+pub(crate) fn machine_id(app_state: &AppState) -> String {
     if let Ok(Some(id)) = app_state.db.get_setting(MACHINE_ID_KEY) {
         if !id.is_empty() {
             return id;
@@ -990,6 +996,11 @@ pub struct AgentDisplayMessage {
     pub duration_seconds: u32,
     /// Image data-URLs attached to this message (rebuilt from on-disk refs).
     pub images: Vec<String>,
+    /// Present iff this row anchors an Auto-mode turn (P7). The frontend
+    /// swaps the normal text bubble for an `<AutoRunPanel runId=...>` when
+    /// this is set. Parsed from the row's `metadata.auto_run_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_run_id: Option<String>,
 }
 
 /// Pull a short, human-friendly summary out of a tool call's JSON arguments.
@@ -1618,7 +1629,10 @@ async fn run_agent_turn(
     Ok(())
 }
 
-/// Cancel a running session.
+/// Cancel a running session. Triggers both the regular session-manager path
+/// (no-op for sessions not registered there) and the Auto-mode cancellation
+/// token (no-op for sessions not running an Auto turn) — the same stop
+/// button drives both, so we don't need to know which one is active.
 #[tauri::command]
 pub async fn agent_cancel_session(
     session_id: String,
@@ -1629,6 +1643,22 @@ pub async fn agent_cancel_session(
         if let Some(ref manager) = *guard {
             manager.cancel_session(&session_id).await;
         }
+    }
+    // Auto-mode: trigger the executor's CancellationToken if a run is in
+    // flight for this session. The executor checks `cancel.cancelled()` at
+    // every iteration boundary and exits via `finalize_cancelled`.
+    let auto_token = agent_state
+        .auto_cancellation
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .cloned();
+    log::info!(
+        "[Auto-P7] agent_cancel_session session={} auto_token_present={}",
+        session_id, auto_token.is_some()
+    );
+    if let Some(token) = auto_token {
+        token.cancel();
     }
     agent_state.approval_handlers.write().await.remove(&session_id);
     Ok(())
@@ -1704,6 +1734,9 @@ pub async fn agent_get_messages(
             pending_started = None;
             (Vec::new(), 0)
         };
+        let auto_run_id = serde_json::from_str::<serde_json::Value>(&msg.metadata)
+            .ok()
+            .and_then(|v| v.get("auto_run_id").and_then(|x| x.as_str()).map(String::from));
         out.push(AgentDisplayMessage {
             id: msg.id.to_string(),
             role: msg.role.clone(),
@@ -1713,6 +1746,7 @@ pub async fn agent_get_messages(
             tools,
             duration_seconds,
             images,
+            auto_run_id,
         });
     }
     Ok(out)

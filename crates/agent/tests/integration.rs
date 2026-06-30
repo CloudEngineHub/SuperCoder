@@ -1148,6 +1148,7 @@ async fn test_system_prompt_cache_breakpoints_under_anthropic_limit() {
             name: "noop".into(),
             description: Some("never invoked; present only to exercise tools-level cache".into()),
             parameters: Some(json!({"type": "object", "properties": {}, "additionalProperties": false})),
+            strict: None,
         },
         cache_control: None,
     }];
@@ -1281,13 +1282,15 @@ async fn test_auto_run_worker_single_live() {
     let template = make_config(&api_key(), tmp.path().to_path_buf());
 
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
+    let mut worker_llm_configs = std::collections::HashMap::new();
+    worker_llm_configs.insert(template.llm.model.clone(), template.llm.clone());
     let ctx = WorkerContext {
         session_id: "parent".into(),
         run_id: "auto-run-1".into(),
         working_dir: tmp.path().to_path_buf(),
         event_tx,
         cancel_token: CancellationToken::new(),
-        llm_base_config: template.llm.clone(),
+        worker_llm_configs,
         retry_config: template.retry_config.clone(),
         compaction_config: template.compaction_config.clone(),
         compaction_llm: template.compaction_llm.clone(),
@@ -1508,19 +1511,28 @@ async fn test_auto_executor_end_to_end_live() {
         policy: LlmPolicy::default(),
     };
 
-    // Worker LLM template — model is overridden per worker by run_worker.
-    let worker_llm_base = LlmClientConfig {
-        provider: Provider::Anthropic,
-        base_url: "https://api.anthropic.com".into(),
-        model: "placeholder".into(),
-        api_key: api_key.clone(),
-        temperature: Some(0.0),
-        max_completion_tokens: Some(2048),
-        extra_headers: vec![],
-        thinking: None,
-        disable_cache_control: true,
-        policy: LlmPolicy::default(),
-    };
+    // Per-worker LLM configs keyed by model name. Both pool models share the
+    // same Anthropic provider for this end-to-end test.
+    let worker_llm_configs: std::collections::HashMap<String, LlmClientConfig> = pool
+        .iter()
+        .map(|e| {
+            (
+                e.model.clone(),
+                LlmClientConfig {
+                    provider: Provider::Anthropic,
+                    base_url: "https://api.anthropic.com".into(),
+                    model: e.model.clone(),
+                    api_key: api_key.clone(),
+                    temperature: Some(0.0),
+                    max_completion_tokens: Some(2048),
+                    extra_headers: vec![],
+                    thinking: None,
+                    disable_cache_control: true,
+                    policy: LlmPolicy::default(),
+                },
+            )
+        })
+        .collect();
 
     let cancel = CancellationToken::new();
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
@@ -1534,7 +1546,7 @@ async fn test_auto_executor_end_to_end_live() {
         working_dir: working_dir.clone(),
         event_tx: event_tx.clone(),
         cancel_token: cancel.clone(),
-        llm_base_config: worker_llm_base,
+        worker_llm_configs,
         retry_config: RetryConfig::default(),
         compaction_config: Default::default(),
         compaction_llm: None,
@@ -1559,6 +1571,9 @@ async fn test_auto_executor_end_to_end_live() {
         session_id: session_id.clone(),
         worker_pool: pool,
         replan_budget: 1,
+        resume_from: None,
+        start_at_worker_id: None,
+        initial_replan_reason: None,
     };
 
     // Collect events on a side task so they don't fill the channel buffer.
@@ -1582,7 +1597,7 @@ async fn test_auto_executor_end_to_end_live() {
         })
     };
 
-    let result = run_auto(config, event_tx, plan_gen, runner, approver, cancel).await;
+    let result = run_auto(config, event_tx, plan_gen, runner, approver, cancel, None).await;
     // Wait for the collector to drain the terminal event.
     let _ = tokio::time::timeout(Duration::from_secs(5), collector).await;
 

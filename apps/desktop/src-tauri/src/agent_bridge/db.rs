@@ -150,6 +150,8 @@ impl AgentDb {
                  worker_results  TEXT NOT NULL DEFAULT '[]',
                  cost_cents      INTEGER NOT NULL DEFAULT 0,
                  replans_used    INTEGER NOT NULL DEFAULT 0,
+                 current_worker  TEXT NOT NULL DEFAULT 'null',
+                 pending_failure TEXT NOT NULL DEFAULT 'null',
                  created_at      TEXT NOT NULL,
                  updated_at      TEXT NOT NULL
              );
@@ -166,6 +168,28 @@ impl AgentDb {
                 if !e.to_string().contains("duplicate column") {
                     return Err(e.into());
                 }
+            }
+        }
+        // Idempotent migration: `current_worker` lets a mid-flight reload
+        // show "Running: wN (model)" instead of just "status: running".
+        // Stored as JSON; literal 'null' means no worker in flight.
+        if let Err(e) = conn.execute(
+            "ALTER TABLE auto_runs ADD COLUMN current_worker TEXT NOT NULL DEFAULT 'null'",
+            [],
+        ) {
+            if !e.to_string().contains("duplicate column") {
+                return Err(e.into());
+            }
+        }
+        // Idempotent migration: `pending_failure` carries the
+        // WorkerFailureContext for the user-driven Retry/Replan/Cancel
+        // banner (P9c). JSON; literal 'null' means no pending failure.
+        if let Err(e) = conn.execute(
+            "ALTER TABLE auto_runs ADD COLUMN pending_failure TEXT NOT NULL DEFAULT 'null'",
+            [],
+        ) {
+            if !e.to_string().contains("duplicate column") {
+                return Err(e.into());
             }
         }
 
@@ -548,6 +572,22 @@ impl AgentDb {
         Ok(conn.changes() as usize)
     }
 
+    /// Overwrite the `llm_message` JSON of an existing row. Used by the Auto
+    /// path to update a placeholder assistant row's content once the run
+    /// terminates (last worker summary, failure reason, or "cancelled").
+    pub fn update_message_llm_content(
+        &self,
+        row_id: i64,
+        llm_message: &str,
+    ) -> Result<(), AgentDbError> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE agent_messages SET llm_message = ? WHERE id = ?",
+            rusqlite::params![llm_message, row_id],
+        )?;
+        Ok(())
+    }
+
     /// Soft-delete all messages with turn_count >= from_turn for a session.
     /// Used after a checkpoint restore so the conversation matches the files.
     pub fn rewind_from_turn(
@@ -678,6 +718,8 @@ impl AgentDb {
         let conn = self.conn.lock();
         let plan_versions = serde_json::to_string(&run.plan_versions)?;
         let worker_results = serde_json::to_string(&run.worker_results)?;
+        let current_worker = serde_json::to_string(&run.current_worker)?;
+        let pending_failure = serde_json::to_string(&run.pending_failure)?;
         let status = serde_json::to_string(&run.status)?
             .trim_matches('"')
             .to_string();
@@ -685,8 +727,9 @@ impl AgentDb {
         conn.execute(
             "INSERT INTO auto_runs
                  (id, session_id, status, plan_versions, worker_results,
-                  cost_cents, replans_used, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  cost_cents, replans_used, current_worker, pending_failure,
+                  created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params![
                 run.id,
                 run.session_id,
@@ -695,6 +738,8 @@ impl AgentDb {
                 worker_results,
                 run.cost_cents as i64,
                 run.replans_used as i64,
+                current_worker,
+                pending_failure,
                 now,
                 now,
             ],
@@ -709,6 +754,8 @@ impl AgentDb {
         let conn = self.conn.lock();
         let plan_versions = serde_json::to_string(&run.plan_versions)?;
         let worker_results = serde_json::to_string(&run.worker_results)?;
+        let current_worker = serde_json::to_string(&run.current_worker)?;
+        let pending_failure = serde_json::to_string(&run.pending_failure)?;
         let status = serde_json::to_string(&run.status)?
             .trim_matches('"')
             .to_string();
@@ -716,7 +763,8 @@ impl AgentDb {
         conn.execute(
             "UPDATE auto_runs SET
                  status = ?, plan_versions = ?, worker_results = ?,
-                 cost_cents = ?, replans_used = ?, updated_at = ?
+                 cost_cents = ?, replans_used = ?, current_worker = ?,
+                 pending_failure = ?, updated_at = ?
              WHERE id = ?",
             rusqlite::params![
                 status,
@@ -724,6 +772,8 @@ impl AgentDb {
                 worker_results,
                 run.cost_cents as i64,
                 run.replans_used as i64,
+                current_worker,
+                pending_failure,
                 now,
                 run.id,
             ],
@@ -736,7 +786,7 @@ impl AgentDb {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, status, plan_versions, worker_results,
-                    cost_cents, replans_used
+                    cost_cents, replans_used, current_worker, pending_failure
              FROM auto_runs WHERE id = ?",
         )?;
         let mut rows = stmt.query(rusqlite::params![id])?;
@@ -744,12 +794,16 @@ impl AgentDb {
             let status_raw: String = row.get(2)?;
             let plan_versions_raw: String = row.get(3)?;
             let worker_results_raw: String = row.get(4)?;
+            let current_worker_raw: String = row.get(7)?;
+            let pending_failure_raw: String = row.get(8)?;
             // Status round-trip: serde wraps strings in quotes, so we add them
             // back before deserializing the snake_case-renamed enum.
             let status: agent::auto::AutoStatus =
                 serde_json::from_str(&format!("\"{}\"", status_raw))?;
             let plan_versions = serde_json::from_str(&plan_versions_raw)?;
             let worker_results = serde_json::from_str(&worker_results_raw)?;
+            let current_worker = serde_json::from_str(&current_worker_raw)?;
+            let pending_failure = serde_json::from_str(&pending_failure_raw)?;
             Ok(Some(agent::auto::AutoRun {
                 id: row.get(0)?,
                 session_id: row.get(1)?,
@@ -758,10 +812,74 @@ impl AgentDb {
                 worker_results,
                 cost_cents: row.get::<_, i64>(5)? as u32,
                 replans_used: row.get::<_, i64>(6)? as u32,
+                current_worker,
+                pending_failure,
             }))
         } else {
             Ok(None)
         }
+    }
+
+    /// Mark zombie `auto_runs` rows as `failed` at app startup. Reaps rows
+    /// where there was an actively-executing task that died (planning =
+    /// orchestrator in flight, running = workers in flight). Deliberately
+    /// SKIPS `awaiting_approval` and `awaiting_failure_decision` — those
+    /// rows have no in-flight work and the resume path spawns a fresh
+    /// executor on the user's button click. Returns rows updated.
+    pub fn mark_zombie_auto_runs_failed(&self) -> Result<usize, AgentDbError> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE auto_runs
+               SET status = 'failed', updated_at = ?
+             WHERE status IN ('planning', 'running')",
+            rusqlite::params![now_iso()],
+        )?;
+        Ok(n)
+    }
+
+    /// Find the `agent_messages.id` of the placeholder assistant row that
+    /// anchors a given Auto run, used by the Resume path to reuse the
+    /// existing chat-thread anchor instead of creating duplicates.
+    pub fn find_auto_assistant_row_id(&self, auto_run_id: &str) -> Result<Option<i64>, AgentDbError> {
+        let conn = self.conn.lock();
+        let result = conn.query_row(
+            "SELECT id FROM agent_messages
+             WHERE role = 'assistant'
+               AND json_extract(metadata, '$.auto_run_id') = ?
+               AND rewound_at IS NULL
+             ORDER BY id ASC LIMIT 1",
+            [auto_run_id],
+            |row| row.get::<_, i64>(0),
+        );
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Recover the original user prompt for an Auto run (the user row
+    /// `run_auto_turn` persisted at start). Needed by the Resume path so the
+    /// executor can call the orchestrator on replan with the same task.
+    pub fn find_auto_user_prompt(&self, auto_run_id: &str) -> Result<Option<String>, AgentDbError> {
+        let conn = self.conn.lock();
+        let result = conn.query_row(
+            "SELECT llm_message FROM agent_messages
+             WHERE role = 'user'
+               AND json_extract(metadata, '$.auto_run_id') = ?
+               AND rewound_at IS NULL
+             ORDER BY id ASC LIMIT 1",
+            [auto_run_id],
+            |row| row.get::<_, String>(0),
+        );
+        let llm_json = match result {
+            Ok(j) => j,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // llm_message is `{"role":"user","content":"<prompt>"}`.
+        let v: serde_json::Value = serde_json::from_str(&llm_json)?;
+        Ok(v.get("content").and_then(|c| c.as_str()).map(String::from))
     }
 
     /// List `auto_runs` rows for a session, most-recently-updated first.
@@ -773,7 +891,7 @@ impl AgentDb {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, status, plan_versions, worker_results,
-                    cost_cents, replans_used
+                    cost_cents, replans_used, current_worker, pending_failure
              FROM auto_runs WHERE session_id = ?
              ORDER BY updated_at DESC",
         )?;
@@ -783,6 +901,8 @@ impl AgentDb {
             let status_raw: String = row.get(2)?;
             let plan_versions_raw: String = row.get(3)?;
             let worker_results_raw: String = row.get(4)?;
+            let current_worker_raw: String = row.get(7)?;
+            let pending_failure_raw: String = row.get(8)?;
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -791,11 +911,13 @@ impl AgentDb {
                 worker_results_raw,
                 row.get::<_, i64>(5)?,
                 row.get::<_, i64>(6)?,
+                current_worker_raw,
+                pending_failure_raw,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, session_id, status_raw, plans_raw, results_raw, cost, replans) = row?;
+            let (id, session_id, status_raw, plans_raw, results_raw, cost, replans, current_raw, pending_raw) = row?;
             let status: agent::auto::AutoStatus =
                 serde_json::from_str(&format!("\"{}\"", status_raw))?;
             out.push(agent::auto::AutoRun {
@@ -806,6 +928,8 @@ impl AgentDb {
                 worker_results: serde_json::from_str(&results_raw)?,
                 cost_cents: cost as u32,
                 replans_used: replans as u32,
+                current_worker: serde_json::from_str(&current_raw)?,
+                pending_failure: serde_json::from_str(&pending_raw)?,
             });
         }
         Ok(out)
@@ -1313,6 +1437,8 @@ mod tests {
             worker_results: Vec::new(),
             cost_cents: 0,
             replans_used: 0,
+            current_worker: None,
+            pending_failure: None,
         };
         db.insert_auto_run(&initial).unwrap();
 
@@ -1350,6 +1476,8 @@ mod tests {
             }],
             cost_cents: 42,
             replans_used: 1,
+            current_worker: None,
+            pending_failure: None,
         };
         db.update_auto_run(&updated).unwrap();
 
@@ -1381,6 +1509,8 @@ mod tests {
             worker_results: Vec::new(),
             cost_cents: 0,
             replans_used: 0,
+            current_worker: None,
+            pending_failure: None,
         };
         db.insert_auto_run(&other).unwrap();
         let runs = db.list_auto_runs_for_session("sess-1").unwrap();
@@ -1418,6 +1548,8 @@ mod tests {
                 worker_results: Vec::new(),
                 cost_cents: 0,
                 replans_used: 0,
+                current_worker: None,
+                pending_failure: None,
             };
             db.insert_auto_run(&run).unwrap();
             let loaded = db.get_auto_run(&id).unwrap().unwrap();

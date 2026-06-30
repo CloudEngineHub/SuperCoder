@@ -16,6 +16,7 @@
 //! Phase: P1 (PHASE_AUTO_MODE.md). Sequencing across workers + the orchestrator
 //! itself land in P2/P3.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -61,8 +62,13 @@ pub struct WorkerContext {
     pub event_tx: mpsc::Sender<AgentEvent>,
     pub cancel_token: CancellationToken,
 
-    /// Base LLM config. `model` is overridden per worker from `WorkerSpec`.
-    pub llm_base_config: LlmClientConfig,
+    /// Per-worker LLM configs keyed by model name. Built once at run start
+    /// (`auto.rs::build_worker_llm_configs`) by resolving each `WorkerPoolEntry`
+    /// to its provider's `LlmClientConfig`. The config's `model` field already
+    /// matches its key, so dispatch is a clone of the entry — no override.
+    /// Missing key = orchestrator picked a model not in the pool → worker
+    /// returns `WorkerStatus::LlmError` and the executor's replan path kicks in.
+    pub worker_llm_configs: HashMap<String, LlmClientConfig>,
     pub retry_config: RetryConfig,
     pub compaction_config: CompactionConfig,
     pub compaction_llm: Option<LlmClientConfig>,
@@ -105,9 +111,42 @@ pub async fn run_worker(
     //    the orchestrator's task prompt.
     let user_text = build_worker_user_message(spec, prior_results);
 
-    // 3. Build the child LlmClientConfig with this worker's model.
-    let mut child_llm = ctx.llm_base_config.clone();
-    child_llm.model = spec.model.clone();
+    // 3. Look up this worker's LlmClientConfig from the per-provider map.
+    //    Miss means the orchestrator hallucinated a model that isn't in the
+    //    pool — surface as a hard failure so the executor's replan path
+    //    kicks in with the failure context.
+    let child_llm = match ctx.worker_llm_configs.get(&spec.model) {
+        Some(cfg) => cfg.clone(),
+        None => {
+            let msg = format!(
+                "model `{}` is not in the configured worker pool — \
+                 orchestrator picked an unknown model",
+                spec.model
+            );
+            let status = WorkerStatus::LlmError { message: msg.clone() };
+            let _ = ctx
+                .event_tx
+                .send(AgentEvent::AutoWorkerEnd {
+                    session_id: ctx.session_id.clone(),
+                    run_id: ctx.run_id.clone(),
+                    worker_id: spec.id.clone(),
+                    summary: msg.clone(),
+                    cost_cents: 0,
+                    tool_count: 0,
+                    status: status.clone(),
+                })
+                .await;
+            return WorkerResult {
+                id: spec.id.clone(),
+                model: spec.model.clone(),
+                prompt: spec.prompt.clone(),
+                summary: msg,
+                tool_count: 0,
+                cost_cents: 0,
+                status,
+            };
+        }
+    };
 
     // 4. Build the child AgentConfig. system_prompt=None → AgentLoop builds
     //    the standard Coding-mode prompt internally. No skills/subagents
@@ -138,17 +177,52 @@ pub async fn run_worker(
     });
     let child_registry = ToolRegistry::for_mode(ToolMode::Coding, context_engine_arg, None);
 
-    // 6. Child event channel + drain task. We don't relay child events to the
-    //    parent UI (per the AutoWorkerStart/End contract — the UI shows a
-    //    collapsed card and will fetch the trace on demand in P6). The drain
-    //    counts ToolEnd events so the parent's WorkerResult has a meaningful
-    //    `tool_count`.
+    // 6. Child event channel + drain task. Most child events are discarded
+    //    at the relay layer (workers don't stream text into the parent chat),
+    //    but ToolStart/ToolEnd are re-emitted as wrapped Auto* events on the
+    //    parent's channel so the UI can render live tool activity inside the
+    //    running worker card. The drain also counts ToolEnd for the worker's
+    //    `tool_count` summary.
     let (child_tx, mut child_rx) = mpsc::channel::<AgentEvent>(256);
+    let parent_tx_for_drain = ctx.event_tx.clone();
+    let parent_session = ctx.session_id.clone();
+    let parent_run = ctx.run_id.clone();
+    let drain_worker_id = spec.id.clone();
     let drain_handle = tokio::spawn(async move {
         let mut tool_count = 0u32;
         while let Some(ev) = child_rx.recv().await {
-            if matches!(ev, AgentEvent::ToolEnd { .. }) {
-                tool_count += 1;
+            match ev {
+                AgentEvent::ToolStart { tool_call_id, tool_name, args_summary, .. } => {
+                    let _ = parent_tx_for_drain
+                        .send(AgentEvent::AutoWorkerToolStart {
+                            session_id: parent_session.clone(),
+                            run_id: parent_run.clone(),
+                            worker_id: drain_worker_id.clone(),
+                            tool_call_id,
+                            tool_name,
+                            args_summary,
+                        })
+                        .await;
+                }
+                AgentEvent::ToolEnd { tool_call_id, success, summary, .. } => {
+                    tool_count += 1;
+                    let _ = parent_tx_for_drain
+                        .send(AgentEvent::AutoWorkerToolEnd {
+                            session_id: parent_session.clone(),
+                            run_id: parent_run.clone(),
+                            worker_id: drain_worker_id.clone(),
+                            tool_call_id,
+                            success,
+                            summary,
+                        })
+                        .await;
+                }
+                _ => {
+                    // Other child events (TextDelta, ThinkingDelta, TokenUsage,
+                    // TurnCompleted, Done, etc.) intentionally NOT forwarded —
+                    // the parent UI shows worker output via the final
+                    // AutoWorkerEnd summary only.
+                }
             }
         }
         tool_count
@@ -406,16 +480,16 @@ mod tests {
         event_tx: mpsc::Sender<AgentEvent>,
         working_dir: PathBuf,
     ) -> WorkerContext {
-        WorkerContext {
-            session_id: "parent-session".into(),
-            run_id: "run-1".into(),
-            working_dir,
-            event_tx,
-            cancel_token: CancellationToken::new(),
-            llm_base_config: LlmClientConfig {
+        // The only test caller (start_event_carries_...) uses spec.model="gpt-test",
+        // so pre-populate the per-worker map with that key. The LLM call still
+        // fails at localhost (which is what the test pins).
+        let mut worker_llm_configs = HashMap::new();
+        worker_llm_configs.insert(
+            "gpt-test".to_string(),
+            LlmClientConfig {
                 provider,
                 base_url: "http://localhost".into(),
-                model: "placeholder".into(),
+                model: "gpt-test".into(),
                 api_key: String::new(),
                 temperature: None,
                 max_completion_tokens: None,
@@ -424,6 +498,14 @@ mod tests {
                 disable_cache_control: true,
                 policy: LlmPolicy::default(),
             },
+        );
+        WorkerContext {
+            session_id: "parent-session".into(),
+            run_id: "run-1".into(),
+            working_dir,
+            event_tx,
+            cancel_token: CancellationToken::new(),
+            worker_llm_configs,
             retry_config: RetryConfig::default(),
             compaction_config: CompactionConfig::default(),
             compaction_llm: None,

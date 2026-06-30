@@ -354,6 +354,7 @@ impl ToolRegistry {
                     name: tool.name().to_string(),
                     description: Some(tool.description().to_string()),
                     parameters: Some(tool.parameters_schema()),
+                    strict: None,
                 },
                 cache_control: None,
             })

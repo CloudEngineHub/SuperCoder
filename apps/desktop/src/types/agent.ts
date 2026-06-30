@@ -111,6 +111,9 @@ export interface AgentMessage {
     toolCalls: { toolCallId: string; toolName: string; argsSummary: string; status: string; summary?: string }[];
     durationSeconds: number;
   };
+  /** Present iff this row anchors an Auto-mode turn. The thread renderer
+   *  swaps the normal bubble for an inline `<AutoRunPanel runId=...>`. */
+  auto_run_id?: string;
 }
 
 // --- Agent Thread ---
@@ -176,6 +179,10 @@ export interface AgentDisplayMessage {
   duration_seconds: number;
   /** Image data-URLs attached to this message (rebuilt from on-disk refs). */
   images: string[];
+  /** Present iff this row anchors an Auto-mode turn. The message renderer
+   *  swaps the normal text bubble for an `<AutoRunPanel runId=...>` when
+   *  this is set. Populated from `agent_messages.metadata.auto_run_id`. */
+  auto_run_id?: string;
 }
 
 // --- Session (from the `sessions` table via Tauri) ---
@@ -293,6 +300,179 @@ export type SelectionRole = 'active' | 'compaction' | 'title';
 export interface ProvidersResponse {
   providers: ProviderConfig[];
   selection: ModelSelection;
+}
+
+// ── Auto mode ──────────────────────────────────────────────────────────
+// Mirrors Rust types in `agent::auto` + `agent_bridge::auto`. The sentinel
+// (provider_id="auto", model="auto") is what the frontend writes when the
+// user picks Auto in the picker; the backend special-cases it to dispatch
+// into the orchestrator pipeline instead of a normal LLM call.
+
+/** Sentinel constants for the "Auto" pseudo-provider/model. */
+export const AUTO_SENTINEL_PROVIDER_ID = 'auto';
+export const AUTO_SENTINEL_MODEL = 'auto';
+
+/** One entry in the user-curated worker pool. Mirrors Rust `WorkerPoolEntry`. */
+export interface WorkerPoolEntry {
+  providerId: string;
+  model: string;
+  /** User-written hint the orchestrator sees when picking a model per subtask. */
+  description: string;
+}
+
+/** Full Auto settings. Returned by `agent_get_auto_settings`. Mirrors Rust `AutoSettings`. */
+export interface AutoSettings {
+  /** Master switch; the picker shows the Auto entry iff this is true. */
+  enabled: boolean;
+  /** User-picked orchestrator model. `null` until configured. */
+  orchestrator: ModelRef | null;
+  workerPool: WorkerPoolEntry[];
+}
+
+/** Worker's `see_prior` from the orchestrator. Untagged enum on the wire:
+ * `"none"` | `"all"` | `string[]` (worker ids). */
+export type SeePrior = 'none' | 'all' | string[];
+
+/** Spec for one worker in an orchestrator plan. Mirrors Rust `WorkerSpec`. */
+export interface WorkerSpec {
+  id: string;
+  model: string;
+  prompt: string;
+  see_prior: SeePrior;
+}
+
+/** Terminal status of a worker. Mirrors Rust `WorkerStatus` (tagged enum). */
+export type WorkerStatus =
+  | { kind: 'ok' }
+  | { kind: 'max_iterations' }
+  | { kind: 'tool_error'; message: string }
+  | { kind: 'llm_error'; message: string }
+  | { kind: 'cancelled' };
+
+/** Result of executing one worker. Mirrors Rust `WorkerResult`. */
+export interface WorkerResult {
+  id: string;
+  model: string;
+  prompt: string;
+  summary: string;
+  tool_count: number;
+  cost_cents: number;
+  status: WorkerStatus;
+}
+
+/** Terminal status of an Auto run. Mirrors Rust `AutoStatus`. */
+export type AutoStatus =
+  | 'planning'
+  | 'awaiting_approval'
+  | 'running'
+  | 'awaiting_failure_decision'
+  | 'done'
+  | 'failed'
+  | 'cancelled';
+
+/** User-recoverable worker failure context. Mirrors Rust `WorkerFailureContext`.
+ *  Present on AutoRun.pending_failure when status is awaiting_failure_decision. */
+export interface WorkerFailureContext {
+  worker_id: string;
+  worker_model: string;
+  worker_prompt: string;
+  error_message: string;
+}
+
+/** One orchestrator-produced plan version. Mirrors Rust `Plan`. */
+export interface Plan {
+  version: number;
+  reasoning: string;
+  workers: WorkerSpec[];
+}
+
+/** Persisted Auto-run snapshot. Mirrors Rust `AutoRun` from the `auto_runs`
+ *  table. Returned by `agent_get_auto_run(run_id)` for the AutoRunPanel to
+ *  hydrate from disk on mount when in-memory state is missing. */
+export interface AutoRun {
+  id: string;
+  session_id: string;
+  status: AutoStatus;
+  plan_versions: Plan[];
+  worker_results: WorkerResult[];
+  cost_cents: number;
+  replans_used: number;
+  /** Set while a worker is in flight. Cleared back to null on AutoWorkerEnd
+   *  (the completed result lands in worker_results). Persists in the
+   *  snapshot so a mid-flight reload shows "Running: wN (model)" instead
+   *  of just "status: running". */
+  current_worker: WorkerSpec | null;
+  /** Set when a worker hard-fails and the run pauses awaiting user
+   *  decision (Retry / Replan / Cancel from the panel banner). */
+  pending_failure: WorkerFailureContext | null;
+}
+
+// Event payloads emitted on `agent:auto_*` Tauri channels. Each carries
+// `thread_id` so the UI can route to the right session card stack.
+
+export interface AutoPlanningEvent {
+  thread_id: string;
+  run_id: string;
+}
+export interface AutoPlanEvent {
+  thread_id: string;
+  run_id: string;
+  version: number;
+  reasoning: string;
+  plan: WorkerSpec[];
+}
+export interface AutoAwaitingApprovalEvent {
+  thread_id: string;
+  run_id: string;
+}
+export interface AutoWorkerStartEvent {
+  thread_id: string;
+  run_id: string;
+  worker_id: string;
+  model: string;
+  prompt: string;
+}
+export interface AutoWorkerEndEvent {
+  thread_id: string;
+  run_id: string;
+  worker_id: string;
+  summary: string;
+  cost_cents: number;
+  tool_count: number;
+  status: WorkerStatus;
+}
+export interface AutoWorkerToolStartEvent {
+  thread_id: string;
+  run_id: string;
+  worker_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  args_summary: string;
+}
+export interface AutoWorkerToolEndEvent {
+  thread_id: string;
+  run_id: string;
+  worker_id: string;
+  tool_call_id: string;
+  success: boolean;
+  summary: string;
+}
+export interface AutoReplanEvent {
+  thread_id: string;
+  run_id: string;
+  reason: string;
+}
+export interface AutoFailedEvent {
+  thread_id: string;
+  run_id: string;
+  reason: string;
+  last_worker_output: string | null;
+}
+export interface AutoDoneEvent {
+  thread_id: string;
+  run_id: string;
+  summary: string;
+  total_cost_cents: number;
 }
 
 /** Opt-in context engine (semantic + graph code search) connection. */

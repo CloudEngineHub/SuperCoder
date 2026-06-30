@@ -15,7 +15,11 @@ pub struct WorkerSpec {
     pub model: String,
     /// Natural-language task for this worker. Becomes its user prompt.
     pub prompt: String,
-    /// Which prior worker outputs (if any) get injected into this worker's prompt.
+    /// Which prior worker outputs (if any) get injected into this worker's
+    /// prompt. Defaults to `"all"` (see `SeePrior::default`) when the
+    /// orchestrator omits it — providers don't always enforce required
+    /// fields in tool schemas.
+    #[serde(default)]
     pub see_prior: SeePrior,
 }
 
@@ -28,6 +32,18 @@ pub struct WorkerSpec {
 pub enum SeePrior {
     Keyword(SeePriorKeyword),
     Specific(Vec<String>),
+}
+
+impl Default for SeePrior {
+    /// Defaults to `"all"` when the orchestrator omits the field on a worker.
+    /// Matches the system-prompt guidance ("Default see_prior to 'all' for
+    /// any worker after the first"). Harmless on w1 (no prior outputs exist
+    /// to inject). Defensive against Anthropic/OpenAI tool-call payloads
+    /// dropping fields despite the schema marking them required — the
+    /// schema is a hint, not server-enforced.
+    fn default() -> Self {
+        SeePrior::Keyword(SeePriorKeyword::All)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -103,6 +119,31 @@ pub struct AutoRun {
     pub worker_results: Vec<WorkerResult>,
     pub cost_cents: u32,
     pub replans_used: u32,
+    /// Worker currently being executed, if any. Set by the executor right
+    /// before `worker_runner.run(...)` and cleared back to `None` once that
+    /// worker finishes (the completed result lands in `worker_results`).
+    /// Lets a mid-flight reload show "Running: wN (model)" instead of just
+    /// "status: running" with no indication of which step is in flight.
+    #[serde(default)]
+    pub current_worker: Option<WorkerSpec>,
+    /// Set when a worker hard-fails and the executor terminates the run as
+    /// Failed but user-recoverable. Carries the failed worker's spec + the
+    /// raw error message so the frontend can render a Retry/Replan/Cancel
+    /// banner and the resume path knows which worker to re-run / what
+    /// failure context to feed the orchestrator.
+    #[serde(default)]
+    pub pending_failure: Option<WorkerFailureContext>,
+}
+
+/// User-recoverable worker failure context attached to an `AutoRun` snapshot.
+/// Set by the executor on hard worker failure; cleared on a Retry/Replan
+/// resume kicking off a fresh executor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkerFailureContext {
+    pub worker_id: String,
+    pub worker_model: String,
+    pub worker_prompt: String,
+    pub error_message: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,6 +152,11 @@ pub enum AutoStatus {
     Planning,
     AwaitingApproval,
     Running,
+    /// Worker hard-failed; awaiting user decision via the panel's
+    /// Retry/Replan/Cancel banner. AutoRun.pending_failure carries the
+    /// context. The executor task is dead by the time this status is
+    /// persisted — user action spawns a fresh executor (resume path).
+    AwaitingFailureDecision,
     Done,
     Failed,
     Cancelled,
@@ -130,7 +176,13 @@ pub enum AutoResult {
 
 /// One entry in the user's curated worker pool (Settings → Auto → Worker pool).
 /// `description` is fed verbatim to the orchestrator so it can pick wisely.
+///
+/// camelCase on the wire to match the rest of the desktop TS surface
+/// (`AutoSettings.workerPool[].providerId`). Pure-Rust callers (tests,
+/// orchestrator prompt formatter) still use the snake_case field names —
+/// rename_all only affects serde, not field access.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkerPoolEntry {
     pub provider_id: String,
     pub model: String,

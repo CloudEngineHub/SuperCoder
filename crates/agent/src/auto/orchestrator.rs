@@ -22,7 +22,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::auto::schema::{submit_plan_tool, SUBMIT_PLAN_TOOL_NAME};
+use crate::auto::schema::{submit_plan_tool, submit_plan_tool_strict, SUBMIT_PLAN_TOOL_NAME};
 use crate::auto::types::{Plan, WorkerPoolEntry, WorkerResult, WorkerSpec};
 use crate::llm::anthropic::ANTHROPIC_VERSION;
 use crate::llm::{LlmClientConfig, Provider};
@@ -148,6 +148,20 @@ fn format_user_message(req: &OrchestratorRequest) -> String {
     s
 }
 
+/// Human-readable name of a serde_json::Value variant. Used in parse error
+/// messages so the operator can see what shape the orchestrator actually
+/// returned ("got string" vs "got object" etc.).
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 fn worker_status_short(status: &crate::auto::types::WorkerStatus) -> &'static str {
     use crate::auto::types::WorkerStatus::*;
     match status {
@@ -174,10 +188,36 @@ pub fn parse_plan_from_tool_input(input: &Value, version: u32) -> Result<Plan, S
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing `reasoning` field (must be string)".to_string())?;
 
-    let plan_arr = input
+    // Tolerant `plan` extraction. Opus has been observed returning the array
+    // wrapped in a JSON string (`"plan": "[{...}]"`) instead of an actual
+    // array — a known LLM drift on nested structures despite the schema
+    // marking it `type: array`. We accept both shapes and warn loudly when
+    // the coercion fires so we can track how often providers do this.
+    let plan_value = input
         .get("plan")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "missing `plan` field (must be array)".to_string())?;
+        .ok_or_else(|| "missing `plan` field".to_string())?;
+    let plan_owned: Value; // backing storage when we re-parse from a string
+    let plan_arr: &Vec<Value> = match plan_value {
+        Value::Array(arr) => arr,
+        Value::String(s) => {
+            log::warn!(
+                "[Auto-P7] orchestrator stringified `plan`; re-parsing as JSON. \
+                 (provider returned `plan: \"[...]\"` instead of `plan: [...]`)"
+            );
+            plan_owned = serde_json::from_str(s).map_err(|e| {
+                format!("`plan` field was a string that failed to re-parse as JSON: {e}")
+            })?;
+            plan_owned
+                .as_array()
+                .ok_or_else(|| "`plan` was a string but didn't contain a JSON array".to_string())?
+        }
+        other => {
+            return Err(format!(
+                "`plan` field must be an array (or stringified array); got {}",
+                value_type_name(other)
+            ));
+        }
+    };
 
     if plan_arr.is_empty() {
         return Err("`plan` array is empty; orchestrator must return at least one worker".into());
@@ -187,8 +227,17 @@ pub fn parse_plan_from_tool_input(input: &Value, version: u32) -> Result<Plan, S
         .iter()
         .enumerate()
         .map(|(i, w)| {
-            serde_json::from_value::<WorkerSpec>(w.clone())
-                .map_err(|e| format!("worker[{i}] shape invalid: {e}"))
+            let missing_see_prior = w.get("see_prior").is_none();
+            let spec = serde_json::from_value::<WorkerSpec>(w.clone())
+                .map_err(|e| format!("worker[{i}] shape invalid: {e}"))?;
+            if missing_see_prior {
+                log::warn!(
+                    "[Auto-P7] orchestrator omitted see_prior on worker[{i}] (id={}); \
+                     defaulted to {:?}. Schema marks it required; provider didn't enforce.",
+                    spec.id, spec.see_prior
+                );
+            }
+            Ok(spec)
         })
         .collect::<Result<Vec<_>, String>>()?;
 
@@ -231,9 +280,17 @@ pub async fn generate_plan(
         match parse_plan_from_tool_input(&raw_input, req.plan_version) {
             Ok(plan) => return Ok(plan),
             Err(e) => {
+                // Pretty-print the raw tool input so we can see exactly what
+                // the orchestrator returned — fundamental for diagnosing
+                // schema-drift bugs (which field, what type, etc.).
+                let raw_pretty = serde_json::to_string_pretty(&raw_input)
+                    .unwrap_or_else(|_| raw_input.to_string());
                 log::warn!(
-                    "[auto::orchestrator] parse attempt {} failed: {e}",
-                    attempt + 1
+                    "[Auto-P7] orchestrator parse attempt {}/{} failed: {e}\n\
+                     ---- RAW TOOL INPUT FROM LLM ----\n{raw_pretty}\n\
+                     ---- END RAW TOOL INPUT ----",
+                    attempt + 1,
+                    PARSE_RETRY_BUDGET + 1,
                 );
                 last_parse_err = Some(e);
                 // Falls through to next iteration; final iteration's Err
@@ -328,13 +385,18 @@ async fn call_openai(
     user: &str,
     cancel: Option<&CancellationToken>,
 ) -> Result<Value, OrchestratorError> {
+    // OpenAI strict-mode tool: structured outputs enforced server-side via
+    // constrained decoding. With this set, the tool_call arguments are
+    // guaranteed to match the (stripped) schema — no see_prior-style drift
+    // possible on the OpenAI path. Anthropic still uses the rich-hint schema
+    // since it doesn't honor `strict`.
     let body = json!({
         "model": llm.model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user",   "content": user}
         ],
-        "tools": [submit_plan_tool()],
+        "tools": [submit_plan_tool_strict()],
         "tool_choice": {"type": "function", "function": {"name": SUBMIT_PLAN_TOOL_NAME}},
         "stream": false,
     });
@@ -553,11 +615,62 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_worker_missing_required_field() {
+    fn parse_coerces_stringified_plan_array() {
+        // Anthropic Opus has been observed wrapping the plan array in a JSON
+        // string. Parser must accept this and re-parse the string.
+        let raw = json!({
+            "reasoning": "stringified-plan workaround",
+            "plan": "[{\"id\":\"w1\",\"model\":\"haiku\",\"prompt\":\"explore\",\"see_prior\":\"none\"}]"
+        });
+        let plan = parse_plan_from_tool_input(&raw, 1).expect("stringified plan must parse");
+        assert_eq!(plan.workers.len(), 1);
+        assert_eq!(plan.workers[0].id, "w1");
+    }
+
+    #[test]
+    fn parse_rejects_plan_string_with_invalid_json() {
+        let raw = json!({
+            "reasoning": "r",
+            "plan": "not-actually-json"
+        });
+        let err = parse_plan_from_tool_input(&raw, 1).unwrap_err();
+        assert!(err.contains("failed to re-parse"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_plan_of_unsupported_type() {
+        let raw = json!({"reasoning": "r", "plan": 42});
+        let err = parse_plan_from_tool_input(&raw, 1).unwrap_err();
+        assert!(err.contains("must be an array"), "got: {err}");
+        assert!(err.contains("number"), "should name the bad type, got: {err}");
+    }
+
+    #[test]
+    fn parse_defaults_missing_see_prior_to_all() {
+        // Anthropic/OpenAI don't server-enforce the tool input_schema, so the
+        // orchestrator sometimes omits `see_prior`. Parsing defaults it to
+        // `"all"` (most-permissive, matches the system-prompt guidance) and
+        // warns instead of failing the whole run.
         let raw = json!({
             "reasoning": "r",
             "plan": [
                 {"id": "w1", "model": "m", "prompt": "p"}  // missing see_prior
+            ]
+        });
+        let plan = parse_plan_from_tool_input(&raw, 1).expect("must parse with default");
+        assert!(matches!(
+            plan.workers[0].see_prior,
+            SeePrior::Keyword(SeePriorKeyword::All)
+        ));
+    }
+
+    #[test]
+    fn parse_still_rejects_worker_missing_truly_required_field() {
+        // `prompt` has no sensible default; missing it must still fail.
+        let raw = json!({
+            "reasoning": "r",
+            "plan": [
+                {"id": "w1", "model": "m"}  // missing both prompt and see_prior
             ]
         });
         let err = parse_plan_from_tool_input(&raw, 1).unwrap_err();

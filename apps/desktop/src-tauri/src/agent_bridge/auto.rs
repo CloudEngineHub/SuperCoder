@@ -16,12 +16,13 @@
 //!     `agent::auto::run_auto` on a task whose events drain through the same
 //!     `spawn_event_relay` the regular path uses.
 //!
-//! v1 limitation: all workers in the pool are dispatched through the
-//! orchestrator's provider config (model name is overridden per worker, but
-//! base_url + api_key + provider come from the orchestrator). Cross-provider
-//! worker pools will work only if the orchestrator's endpoint accepts every
-//! model name; otherwise the failing worker triggers a reactive replan. True
-//! multi-provider dispatch is deferred to a future phase.
+//! Cross-provider worker dispatch (P8): each `WorkerPoolEntry`'s `provider_id`
+//! is resolved at run start by `build_worker_llm_configs` into a
+//! `HashMap<model, LlmClientConfig>` that the executor's `WorkerContext`
+//! holds. `worker::run_worker` looks up its config per spec — mixed-provider
+//! pools (e.g. Anthropic orchestrator + nvidia/Nemotron worker via
+//! OpenRouter) now route to the correct endpoint instead of all hitting the
+//! orchestrator's API.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,15 +30,15 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use agent::agent::config::{CompactionConfig, RetryConfig};
 use agent::auto::{
-    self, AutoResult, AutoRun, AutoStatus, ExecutorConfig, LiveWorkerRunner, LlmPlanGenerator,
-    Plan, PlanApprover, WorkerContext, WorkerPoolEntry,
+    self, AutoResult, AutoRun, AutoStateListener, AutoStatus, ExecutorConfig, LiveWorkerRunner,
+    LlmPlanGenerator, Plan, PlanApprover, WorkerContext, WorkerPoolEntry,
 };
 
 use crate::AppState;
@@ -60,16 +61,18 @@ pub const AUTO_SENTINEL_MODEL: &str = "auto";
 /// the bool/u32 keys).
 const AUTO_ORCHESTRATOR_KEY: &str = "auto_orchestrator_model";
 const AUTO_WORKER_POOL_KEY: &str = "auto_worker_pool";
-const AUTO_REPLAN_BUDGET_KEY: &str = "auto_replan_budget";
 /// Master switch. Auto entry is shown in the model picker iff this is true.
 /// Prereqs (orchestrator picked + worker pool non-empty) are enforced by
 /// `agent_set_auto_enabled` when flipping on, and by a live-session check
 /// when flipping off (see `agent_list_sessions_using_auto`).
 const AUTO_ENABLED_KEY: &str = "auto_enabled";
 
-/// Default replan budget when the user has not configured it.
-/// Matches PHASE_AUTO_MODE.md "Replan budget" decision.
-pub const DEFAULT_REPLAN_BUDGET: u32 = 2;
+/// Hardcoded ceiling on automatic replans inside the executor. Set to 0
+/// because P9c moves replan/retry control to the user (worker failure →
+/// pause → user picks Retry / Replan / Cancel on the panel). The
+/// executor's automatic replan loop is effectively disabled; this constant
+/// is the safety value passed into `ExecutorConfig.replan_budget`.
+pub const AUTO_REPLAN_BUDGET: u32 = 0;
 
 /// Returns true iff `(provider_id, model)` is the Auto sentinel.
 pub fn is_auto_mode(provider_id: &str, model: &str) -> bool {
@@ -78,8 +81,9 @@ pub fn is_auto_mode(provider_id: &str, model: &str) -> bool {
 
 // ── Settings DTO + persistence ───────────────────────────────────────────
 
-/// All four Auto settings in a single struct, returned by
-/// `agent_get_auto_settings` for the Settings UI to consume.
+/// Auto settings returned by `agent_get_auto_settings` for the Settings UI
+/// to consume. Replan budget removed in P9b — user is the budget now via
+/// the Retry / Replan / Cancel buttons on the panel's failure banner.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoSettings {
@@ -93,8 +97,6 @@ pub struct AutoSettings {
     /// User-curated pool of worker models with per-entry descriptions.
     #[serde(default)]
     pub worker_pool: Vec<WorkerPoolEntry>,
-    /// Max reactive replans per task; total orchestrator calls = 1 + budget.
-    pub replan_budget: u32,
 }
 
 pub(crate) fn read_auto_orchestrator(app_state: &AppState) -> Option<ModelRef> {
@@ -116,16 +118,6 @@ pub(crate) fn read_auto_worker_pool(app_state: &AppState) -> Vec<WorkerPoolEntry
         .unwrap_or_default()
 }
 
-pub(crate) fn read_auto_replan_budget(app_state: &AppState) -> u32 {
-    app_state
-        .db
-        .get_setting(AUTO_REPLAN_BUDGET_KEY)
-        .ok()
-        .flatten()
-        .and_then(|raw| raw.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_REPLAN_BUDGET)
-}
-
 pub(crate) fn read_auto_enabled(app_state: &AppState) -> bool {
     app_state
         .db
@@ -141,7 +133,186 @@ pub(crate) fn read_auto_settings(app_state: &AppState) -> AutoSettings {
         enabled: read_auto_enabled(app_state),
         orchestrator: read_auto_orchestrator(app_state),
         worker_pool: read_auto_worker_pool(app_state),
-        replan_budget: read_auto_replan_budget(app_state),
+    }
+}
+
+// ── agent_messages anchor rows (P7) ──────────────────────────────────────
+//
+// Every Auto turn writes one user row + one placeholder assistant row to
+// `agent_messages`, both tagged with `{auto_run_id, kind:"auto"}` metadata.
+// The rich snapshot lives in the `auto_runs` table; these rows are the
+// chat-thread anchors that let the UI render an AutoRunPanel inline at the
+// right position, and that feed the next turn's LLM context with a plain
+// summary string once the run terminates.
+
+fn build_llm_message_json(role: &str, content: &str) -> String {
+    serde_json::json!({ "role": role, "content": content }).to_string()
+}
+
+fn build_auto_metadata_json(auto_run_id: &str) -> String {
+    serde_json::json!({ "auto_run_id": auto_run_id, "kind": "auto" }).to_string()
+}
+
+/// Persist the user prompt + placeholder assistant row for an Auto turn.
+/// Returns the assistant row's numeric id so the executor's terminal handler
+/// can overwrite its `llm_message` with the final summary text.
+async fn persist_auto_anchor_rows(
+    db: Arc<super::db::AgentDb>,
+    session_id: String,
+    folder: String,
+    prompt: String,
+    auto_run_id: String,
+) -> Result<i64, String> {
+    let metadata = build_auto_metadata_json(&auto_run_id);
+
+    let user_llm = build_llm_message_json("user", &prompt);
+    let user_id = {
+        let db = Arc::clone(&db);
+        let sid = session_id.clone();
+        let folder = folder.clone();
+        let meta = metadata.clone();
+        tokio::task::spawn_blocking(move || {
+            db.insert_message(&sid, &folder, "user", "text", &user_llm, &meta, None)
+        })
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+        .map_err(|e| format!("Failed to persist Auto user row: {e}"))?
+    };
+
+    let asst_llm = build_llm_message_json("assistant", "Auto run in progress…");
+    let id_str = {
+        let db = Arc::clone(&db);
+        let sid = session_id.clone();
+        let folder = folder.clone();
+        let meta = metadata.clone();
+        tokio::task::spawn_blocking(move || {
+            db.insert_message(&sid, &folder, "assistant", "text", &asst_llm, &meta, None)
+        })
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+        .map_err(|e| format!("Failed to persist Auto assistant row: {e}"))?
+    };
+    let asst_id = id_str
+        .parse::<i64>()
+        .map_err(|e| format!("bad insert id: {e}"))?;
+    log::info!(
+        "[Auto-P7] persisted anchor rows: session={} run={} user_row={} assistant_row={}",
+        session_id, auto_run_id, user_id, asst_id
+    );
+    Ok(asst_id)
+}
+
+/// Build the per-worker LLM config map for an Auto run by snapshotting the
+/// configured worker pool against the current provider settings.
+///
+/// Each pool entry's `provider_id` is resolved to a `ProviderConfig`, which
+/// feeds `provider_to_llm_config` along with the entry's `model`. The map is
+/// keyed by model name (matching `WorkerSpec.model`), so the executor's
+/// per-worker dispatch (`worker::run_worker`) is a single lookup.
+///
+/// Fail-fast validation here surfaces config drift before any LLM call:
+/// - Missing provider (user deleted it from Settings after adding to pool)
+/// - Duplicate model name across different providers (ambiguous lookup —
+///   `WorkerSpec` carries only `model`, so two pool entries with the same
+///   model under different providers can't be told apart by the dispatcher).
+fn build_worker_llm_configs(
+    app_state: &AppState,
+    pool: &[WorkerPoolEntry],
+) -> Result<HashMap<String, agent::llm::LlmClientConfig>, String> {
+    let mut map: HashMap<String, agent::llm::LlmClientConfig> = HashMap::new();
+    for entry in pool {
+        if map.contains_key(&entry.model) {
+            return Err(format!(
+                "Auto mode: worker pool has duplicate model name `{}` across providers — \
+                 make pool entries' model names unique (the dispatcher looks up by model only)",
+                entry.model
+            ));
+        }
+        let provider = super::commands::provider_by_id_pub(app_state, &entry.provider_id)
+            .ok_or_else(|| {
+                format!(
+                    "Auto mode: worker pool entry `{}` references missing provider id=`{}`. \
+                     Fix Settings → Auto (remove the worker or re-add the provider).",
+                    entry.model, entry.provider_id
+                )
+            })?;
+        let mut cfg = provider_to_llm_config(&provider, &entry.model);
+        // Workers are coding-mode agent loops that take many turns each; their
+        // child loops opt in to cache_control on a per-message basis. We don't
+        // pre-disable it here (let the per-provider LlmClient decide).
+        cfg.disable_cache_control = false;
+        map.insert(entry.model.clone(), cfg);
+    }
+    Ok(map)
+}
+
+/// Flush incremental `AutoRun` snapshots to the `auto_runs` table whenever
+/// the executor mutates state (plan added, worker finished, replan, status
+/// flip). Without this, the DB row stays at the initial `Planning + empty`
+/// state until the run terminates — and a mid-flight reload (or the app
+/// being killed) leaves the panel staring at a stale "Orchestrator is
+/// planning…" forever.
+///
+/// **Ordering invariant**: notifies fire back-to-back (e.g. status=Planning
+/// immediately followed by status=AwaitingApproval). Each `on_state` queues
+/// a write onto a single-writer task via an unbounded mpsc, so writes land
+/// in the exact order the executor produced them. Earlier fire-and-forget
+/// spawning let later snapshots land *before* earlier ones — the older
+/// state would clobber the newer one, the reaper would see stale
+/// `planning` after restart, and the saved `awaiting_approval` got marked
+/// failed on app start. mpsc serialization eliminates the race.
+struct DbAutoStateListener {
+    tx: tokio::sync::mpsc::UnboundedSender<AutoRun>,
+}
+
+impl DbAutoStateListener {
+    fn new(db: Arc<super::db::AgentDb>) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AutoRun>();
+        tokio::spawn(async move {
+            while let Some(run) = rx.recv().await {
+                let db = Arc::clone(&db);
+                let run_id = run.id.clone();
+                match tokio::task::spawn_blocking(move || db.update_auto_run(&run)).await {
+                    Err(e) => log::warn!("[Auto-P7] DbAutoStateListener join error: {e}"),
+                    Ok(Err(e)) => log::warn!(
+                        "[Auto-P7] DbAutoStateListener db write failed for run={run_id}: {e}"
+                    ),
+                    Ok(Ok(())) => {}
+                }
+            }
+        });
+        Self { tx }
+    }
+}
+
+impl AutoStateListener for DbAutoStateListener {
+    fn on_state(&self, run: &AutoRun) {
+        if let Err(e) = self.tx.send(run.clone()) {
+            log::warn!("[Auto-P7] DbAutoStateListener queue closed: {e}");
+        }
+    }
+}
+
+/// Overwrite the placeholder assistant row with the run's terminal summary.
+/// Best-effort: logged and swallowed on failure (the user-facing chat row
+/// stays at "Auto run in progress…" but the live event stream still updates
+/// the panel itself, so the loss is purely textual continuity for the next
+/// LLM turn).
+async fn update_auto_assistant_summary(
+    db: Arc<super::db::AgentDb>,
+    row_id: i64,
+    summary: &str,
+) {
+    let llm = build_llm_message_json("assistant", summary);
+    let preview: String = summary.chars().take(80).collect();
+    let res = tokio::task::spawn_blocking(move || db.update_message_llm_content(row_id, &llm)).await;
+    match res {
+        Ok(Ok(())) => log::info!(
+            "[Auto-P7] updated assistant row {} (len={}, preview={:?})",
+            row_id, summary.len(), preview
+        ),
+        Ok(Err(e)) => log::warn!("[Auto-P7] update_message_llm_content failed row={row_id}: {e}"),
+        Err(e) => log::warn!("[Auto-P7] update_message_llm_content join error row={row_id}: {e}"),
     }
 }
 
@@ -175,20 +346,6 @@ pub async fn agent_set_auto_worker_pool(
 ) -> Result<(), String> {
     let raw = serde_json::to_string(&pool).map_err(|e| e.to_string())?;
     app_state.db.set_setting(AUTO_WORKER_POOL_KEY, &raw)
-}
-
-#[tauri::command]
-pub async fn agent_set_auto_replan_budget(
-    budget: u32,
-    app_state: State<'_, AppState>,
-) -> Result<(), String> {
-    // Per PHASE_AUTO_MODE.md the Settings slider exposes range 0–5.
-    if budget > 5 {
-        return Err(format!(
-            "replan budget {budget} exceeds max (5); see PHASE_AUTO_MODE.md"
-        ));
-    }
-    app_state.db.set_setting(AUTO_REPLAN_BUDGET_KEY, &budget.to_string())
 }
 
 /// Flip the master Auto-enable switch.
@@ -270,6 +427,16 @@ pub fn new_pending_map() -> AutoApprovalPending {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// Cancellation tokens for in-flight Auto runs, keyed by `session_id`. Only
+/// one Auto run per session at a time (enforced by the folder lock), so the
+/// session id is a sufficient key. `agent_cancel_session` looks here when
+/// the stop button fires.
+pub type AutoCancelRegistry = Arc<Mutex<HashMap<String, CancellationToken>>>;
+
+pub fn new_cancel_registry() -> AutoCancelRegistry {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 /// `PlanApprover` impl that blocks on a `oneshot` channel keyed by `run_id`.
 /// The frontend resolves the wait via `agent_approve_auto_plan`. Mirrors the
 /// shape of `TauriApprovalHandler` in `events.rs`.
@@ -299,23 +466,176 @@ impl PlanApprover for TauriPlanApprover {
     }
 }
 
+/// Fetch a persisted `auto_runs` snapshot by `run_id`. The AutoRunPanel
+/// calls this on mount to hydrate from disk when its in-memory state for
+/// that run is empty (e.g. after a page reload, or when opening a session
+/// that has prior Auto turns in its history).
+#[tauri::command]
+pub async fn agent_get_auto_run(
+    run_id: String,
+    agent_state: State<'_, AgentState>,
+) -> Result<Option<AutoRun>, String> {
+    let db = Arc::clone(&agent_state.db);
+    let run_id_for_log = run_id.clone();
+    let snapshot = tokio::task::spawn_blocking(move || db.get_auto_run(&run_id))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+        .map_err(|e| format!("Failed to load auto_run: {e}"))?;
+    log::info!(
+        "[Auto-P7] agent_get_auto_run({}) -> {}",
+        run_id_for_log,
+        snapshot.as_ref().map(|s| format!("status={:?} workers={} plans={}",
+            s.status, s.worker_results.len(), s.plan_versions.len())).unwrap_or_else(|| "None".into())
+    );
+    Ok(snapshot)
+}
+
 /// Resolve a pending plan approval. Called by the frontend after the user
 /// clicks Run (`approved=true`) or Cancel (`approved=false`).
+///
+/// Two paths:
+/// 1. **Live executor** — a `TauriPlanApprover` is parked on a oneshot
+///    keyed by `run_id`. Resolving it unblocks the executor.
+/// 2. **Resume after restart** — no live oneshot exists because the prior
+///    executor task died (app restart, crash). The saved plan is on disk
+///    in `auto_runs.plan_versions`. On `approved=true` we spawn a fresh
+///    executor seeded with the saved snapshot (no orchestrator re-call).
+///    On `approved=false` we just mark the snapshot as failed.
 #[tauri::command]
 pub async fn agent_approve_auto_plan(
+    app_handle: AppHandle,
     run_id: String,
     approved: bool,
+    app_state: State<'_, AppState>,
     agent_state: State<'_, AgentState>,
 ) -> Result<(), String> {
     let sender = agent_state.auto_plan_pending.lock().unwrap().remove(&run_id);
-    match sender {
-        Some(tx) => {
-            let _ = tx.send(approved);
+    if let Some(tx) = sender {
+        let _ = tx.send(approved);
+        return Ok(());
+    }
+
+    // No live oneshot → resume path.
+    log::info!("[Auto-P7] approve fallback: no live oneshot for run={run_id}, treating as resume (approved={approved})");
+    let snapshot = {
+        let db = Arc::clone(&agent_state.db);
+        let run_id_clone = run_id.clone();
+        tokio::task::spawn_blocking(move || db.get_auto_run(&run_id_clone))
+            .await
+            .map_err(|e| format!("join error: {e}"))?
+            .map_err(|e| format!("Failed to load auto_run: {e}"))?
+            .ok_or_else(|| format!("No saved Auto run with id={run_id}"))?
+    };
+    if !matches!(snapshot.status, AutoStatus::AwaitingApproval) {
+        return Err(format!(
+            "Auto run id={run_id} is in status {:?}; resume is only allowed from awaiting_approval",
+            snapshot.status
+        ));
+    }
+    if !approved {
+        // User clicked Cancel on a stale awaiting — just mark failed.
+        let db = Arc::clone(&agent_state.db);
+        let mut snap = snapshot;
+        snap.status = AutoStatus::Failed;
+        let _ = tokio::task::spawn_blocking(move || db.update_auto_run(&snap)).await;
+        return Ok(());
+    }
+
+    // Spawn a fresh executor seeded with the saved snapshot.
+    resume_auto_turn(app_handle, &app_state, &agent_state, snapshot, ResumeAction::ApproveSavedPlan).await
+}
+
+/// P9c: resolve a paused-for-failure Auto run with the user's chosen action.
+/// The snapshot status must be `AwaitingFailureDecision`. Actions:
+///   - `"retry"` → spawn a fresh executor that skips the orchestrator and
+///     restarts the failed worker (via `ResumeAction::RetryWorker`).
+///   - `"replan"` → spawn a fresh executor that calls the orchestrator with
+///     the failure context as the replan reason
+///     (via `ResumeAction::ReplanAfterFailure`).
+///   - `"cancel"` → mark the run terminally Failed in the DB; no executor.
+#[tauri::command]
+pub async fn agent_resolve_worker_failure(
+    app_handle: AppHandle,
+    run_id: String,
+    action: String,
+    app_state: State<'_, AppState>,
+    agent_state: State<'_, AgentState>,
+) -> Result<(), String> {
+    log::info!("[Auto-P7] agent_resolve_worker_failure run={run_id} action={action}");
+    let snapshot = {
+        let db = Arc::clone(&agent_state.db);
+        let run_id_clone = run_id.clone();
+        tokio::task::spawn_blocking(move || db.get_auto_run(&run_id_clone))
+            .await
+            .map_err(|e| format!("join error: {e}"))?
+            .map_err(|e| format!("Failed to load auto_run: {e}"))?
+            .ok_or_else(|| format!("No saved Auto run with id={run_id}"))?
+    };
+    if !matches!(snapshot.status, AutoStatus::AwaitingFailureDecision) {
+        return Err(format!(
+            "Auto run id={run_id} is in status {:?}; failure-resolve is only allowed from awaiting_failure_decision",
+            snapshot.status
+        ));
+    }
+    let failure = snapshot
+        .pending_failure
+        .as_ref()
+        .ok_or_else(|| format!("Auto run id={run_id} is awaiting_failure_decision but has no pending_failure context"))?
+        .clone();
+
+    match action.as_str() {
+        "cancel" => {
+            // 1. Flip the DB row to terminally Failed and clear the pause context.
+            let db = Arc::clone(&agent_state.db);
+            let session_id = snapshot.session_id.clone();
+            let reason = format!(
+                "Cancelled by user after worker {} ({}) failed: {}",
+                failure.worker_id, failure.worker_model, failure.error_message
+            );
+            let mut snap = snapshot;
+            snap.status = AutoStatus::Failed;
+            snap.pending_failure = None;
+            let _ = tokio::task::spawn_blocking(move || db.update_auto_run(&snap)).await;
+
+            // 2. Emit AutoFailed so the frontend's existing handler runs:
+            // setAutoFailed flips the panel to the terminal red banner, and
+            // the post-event snapshot refetch sees pending_failure=null and
+            // doesn't re-hydrate back to amber. Without this emit, the panel
+            // sits on the stale amber banner until the session is reloaded.
+            if let Err(e) = app_handle.emit(
+                "agent:auto_failed",
+                serde_json::json!({
+                    "thread_id": session_id,
+                    "run_id": run_id,
+                    "reason": reason,
+                    "last_worker_output": serde_json::Value::Null,
+                }),
+            ) {
+                log::warn!("[Auto-P9c] failed to emit agent:auto_failed on cancel: {e}");
+            }
             Ok(())
         }
-        None => Err(format!(
-            "No pending Auto-mode approval for run_id={run_id} (already resolved or expired)"
-        )),
+        "retry" => {
+            resume_auto_turn(
+                app_handle,
+                &app_state,
+                &agent_state,
+                snapshot,
+                ResumeAction::RetryWorker { worker_id: failure.worker_id },
+            )
+            .await
+        }
+        "replan" => {
+            resume_auto_turn(
+                app_handle,
+                &app_state,
+                &agent_state,
+                snapshot,
+                ResumeAction::ReplanAfterFailure { reason: failure.error_message },
+            )
+            .await
+        }
+        other => Err(format!("Unknown action `{other}`; expected one of: retry, replan, cancel")),
     }
 }
 
@@ -340,6 +660,10 @@ pub async fn run_auto_turn(
     message: String,
     on_complete: impl FnOnce() + Send + 'static,
 ) -> Result<(), String> {
+    log::info!(
+        "[Auto-P7] run_auto_turn START session={} folder={} prompt_len={}",
+        session_id, folder, message.len()
+    );
     // ── 1. Validate settings ──
     let settings = read_auto_settings(app_state);
     if !settings.enabled {
@@ -361,15 +685,61 @@ pub async fn run_auto_turn(
             )
         })?;
 
-    // ── 2. Build orchestrator + worker LLM configs ──
+    // ── 2. Build orchestrator + per-worker LLM configs ──
     let mut orchestrator_llm = provider_to_llm_config(&orchestrator_provider, &orchestrator_ref.model);
     // The orchestrator is a one-shot tool-use call — explicit cache_control
     // is meaningless for it and the auto::orchestrator IO layer doesn't
     // emit any cache markers anyway.
     orchestrator_llm.disable_cache_control = true;
-    // v1 limitation noted at the top of this file: workers all use the
-    // orchestrator's provider config; only the model field is overridden.
-    let worker_llm_base = orchestrator_llm.clone();
+    // Snapshot the worker pool to a model→LlmClientConfig map. Failures here
+    // (missing provider, duplicate model) reject the whole run before any
+    // LLM call. See `build_worker_llm_configs` for the rules.
+    let worker_llm_configs = build_worker_llm_configs(app_state, &settings.worker_pool)?;
+    log::info!(
+        "[Auto-P7] built worker_llm_configs ({} models): {:?}",
+        worker_llm_configs.len(),
+        worker_llm_configs.keys().collect::<Vec<_>>()
+    );
+
+    // ── 2b. Context engine pass-through ──
+    // When semantic search is ON in Settings, give every worker the
+    // codebase_search + codebase_graph tools (same wiring the regular
+    // run_agent_turn path does). Workers each spawn their own AgentLoop in
+    // Coding mode, which auto-registers those tools when
+    // `AgentConfig.context_engine` is set.
+    let ce_settings = super::commands::read_context_engine(app_state);
+    let ce_for_workers: Option<Arc<dyn agent::context_engine::ContextEngineApi>> =
+        if ce_settings.enabled {
+            let cfg = agent::context_engine::ContextEngineConfig {
+                base_url: super::commands::normalize_base_url(&ce_settings.base_url),
+                user_id: "local".to_string(),
+                workspace_id: 0,
+                machine_id: super::commands::machine_id(app_state),
+                repo_path: folder.clone(),
+                auth_token: String::new(),
+            };
+            Some(Arc::new(agent::context_engine::ContextEngineClient::new(cfg)))
+        } else {
+            None
+        };
+    let ce_repo_path: Option<PathBuf> =
+        if ce_settings.enabled { Some(PathBuf::from(&folder)) } else { None };
+
+    // Keep the index live for this repo while the Auto task runs. Idempotent
+    // — bumps last_used_at + triggers a fresh full_sync + starts the fs
+    // watcher if it wasn't already. Same pattern as run_agent_turn.
+    if ce_settings.enabled {
+        let wm = app_handle
+            .state::<Arc<crate::context_watcher::WatcherManager>>()
+            .inner()
+            .clone();
+        let folder_owned = folder.clone();
+        tokio::spawn(async move {
+            if let Err(e) = wm.start_watching(&folder_owned).await {
+                log::warn!("[ContextWatcher] start_watching failed for {folder_owned}: {e}");
+            }
+        });
+    }
 
     // ── 3. Build event channel + relay ──
     // The relay runs in parallel with the executor; both end-of-Auto event
@@ -397,15 +767,15 @@ pub async fn run_auto_turn(
         working_dir: work_dir.clone(),
         event_tx: event_tx.clone(),
         cancel_token: cancel.clone(),
-        llm_base_config: worker_llm_base,
-        retry_config: RetryConfig::default(),
+        worker_llm_configs,
+        retry_config: RetryConfig::auto_worker(),
         compaction_config: CompactionConfig::default(),
         compaction_llm: None,
         // Worker max_iter matches AgentConfig default per PHASE_AUTO_MODE.md.
         // 100 is the same ceiling a normal agent run gets.
         max_iterations: 100,
-        context_engine: None,
-        context_engine_repo_path: None,
+        context_engine: ce_for_workers,
+        context_engine_repo_path: ce_repo_path,
         persister: None,
         approval_handler: None,
         checkpoint_dir: None,
@@ -420,14 +790,22 @@ pub async fn run_auto_turn(
     ));
 
     let exec_config = ExecutorConfig {
-        task: message,
+        task: message.clone(),
         auto_run_id: auto_run_id.clone(),
         session_id: session_id.clone(),
         worker_pool: settings.worker_pool,
-        replan_budget: settings.replan_budget,
+        replan_budget: AUTO_REPLAN_BUDGET,
+        resume_from: None,
+        start_at_worker_id: None,
+        initial_replan_reason: None,
     };
 
-    // ── 6. Persist initial AutoRun row ──
+    // ── 6. Persist initial AutoRun row + agent_messages anchor pair ──
+    // The auto_runs row is the rich snapshot the AutoRunPanel hydrates from.
+    // The two agent_messages rows are the chat-thread anchors: the user row
+    // shows the prompt, and the placeholder assistant row gets overwritten
+    // with the terminal summary (so the next turn's LLM context sees a plain
+    // continuation, not a hole in history).
     let initial_run = AutoRun {
         id: auto_run_id.clone(),
         session_id: session_id.clone(),
@@ -436,6 +814,8 @@ pub async fn run_auto_turn(
         worker_results: Vec::new(),
         cost_cents: 0,
         replans_used: 0,
+        current_worker: None,
+        pending_failure: None,
     };
     let db = Arc::clone(&agent_state.db);
     let initial_run_for_db = initial_run.clone();
@@ -444,12 +824,64 @@ pub async fn run_auto_turn(
         .map_err(|e| format!("join error: {e}"))?
         .map_err(|e| format!("Failed to insert auto_run: {e}"))?;
 
+    let assistant_row_id = persist_auto_anchor_rows(
+        Arc::clone(&agent_state.db),
+        session_id.clone(),
+        folder.clone(),
+        message.clone(),
+        auto_run_id.clone(),
+    )
+    .await?;
+
+    // Register the cancellation token so `agent_cancel_session` can trigger
+    // it when the user hits the stop button. Removed in the terminal handler
+    // below regardless of how the run ends.
+    agent_state
+        .auto_cancellation
+        .lock()
+        .unwrap()
+        .insert(session_id.clone(), cancel.clone());
+    log::info!("[Auto-P7] registered cancel token for session={}", session_id);
+
     // ── 7. Spawn the executor task ──
+    // Keep a clone of event_tx for the terminal handler — `run_auto` consumes
+    // its own copy, so we need this clone to emit the synthetic AutoFailed
+    // event on user cancellation (executor::finalize_cancelled is silent by
+    // design — terminal cancel signalling is a Tauri-side concern).
+    let event_tx_for_cancel = event_tx.clone();
     let db_for_task = Arc::clone(&agent_state.db);
     let pending_for_cancel = Arc::clone(&agent_state.auto_plan_pending);
+    let cancel_registry = Arc::clone(&agent_state.auto_cancellation);
     let auto_run_id_for_task = auto_run_id.clone();
+    let session_id_for_task = session_id.clone();
+    // Persist intermediate snapshots so reload during a long-running Auto
+    // turn shows the actual progress (plan, completed workers) instead of
+    // the initial Planning state.
+    let state_listener: Option<Arc<dyn AutoStateListener>> = Some(Arc::new(DbAutoStateListener::new(
+        Arc::clone(&agent_state.db),
+    )));
+
     tokio::spawn(async move {
-        let result = auto::run_auto(exec_config, event_tx, plan_gen, runner, approver, cancel).await;
+        let result = auto::run_auto(
+            exec_config,
+            event_tx,
+            plan_gen,
+            runner,
+            approver,
+            cancel,
+            state_listener,
+        )
+        .await;
+
+        log::info!(
+            "[Auto-P7] executor returned: run={} variant={}",
+            auto_run_id_for_task,
+            match &result {
+                AutoResult::Done { .. } => "Done",
+                AutoResult::Failed { .. } => "Failed",
+                AutoResult::Cancelled { .. } => "Cancelled",
+            }
+        );
 
         // Persist terminal state.
         let final_run = match &result {
@@ -458,10 +890,44 @@ pub async fn run_auto_turn(
             | AutoResult::Cancelled { run } => run.clone(),
         };
         let _ = tokio::task::spawn_blocking({
+            let db_for_run = Arc::clone(&db_for_task);
             let final_run = final_run.clone();
-            move || db_for_task.update_auto_run(&final_run)
+            move || db_for_run.update_auto_run(&final_run)
         })
         .await;
+
+        // Overwrite the placeholder assistant row with the terminal summary
+        // so the next LLM turn (Auto or normal) sees the run as a normal
+        // chat exchange instead of "Auto run in progress…".
+        let summary_text = match &result {
+            AutoResult::Done { summary, .. } => summary.clone(),
+            AutoResult::Failed { reason, .. } => format!("Auto run failed: {reason}"),
+            AutoResult::Cancelled { .. } => "Auto run interrupted by user".to_string(),
+        };
+        update_auto_assistant_summary(
+            Arc::clone(&db_for_task),
+            assistant_row_id,
+            &summary_text,
+        )
+        .await;
+
+        // User-cancelled runs don't emit a terminal event from the executor.
+        // Synthesize an AutoFailed so the frontend's existing handler fires
+        // (stops the thinking placeholder, marks the panel terminal, clears
+        // approvals) — same UX as a regular session interrupt.
+        if matches!(&result, AutoResult::Cancelled { .. }) {
+            let _ = event_tx_for_cancel
+                .send(agent::types::AgentEvent::AutoFailed {
+                    session_id: session_id_for_task.clone(),
+                    run_id: auto_run_id_for_task.clone(),
+                    reason: "Interrupted by user".to_string(),
+                    last_worker_output: None,
+                })
+                .await;
+        }
+        // Drop our clone so the relay's event_rx closes once executor's tx
+        // is also dropped — relay terminates cleanly.
+        drop(event_tx_for_cancel);
 
         // Clean up any leftover pending approval (defensive — the executor
         // shouldn't terminate while still holding one, but a cancelled run
@@ -470,11 +936,315 @@ pub async fn run_auto_turn(
             .lock()
             .unwrap()
             .remove(&auto_run_id_for_task);
+        // Drop the cancellation token registration.
+        cancel_registry
+            .lock()
+            .unwrap()
+            .remove(&session_id_for_task);
 
         // Await the relay so the final AutoDone/AutoFailed event has been
-        // emitted to the frontend before we release the folder lock.
+        // emitted to the frontend before we touch session state and release
+        // the folder lock — matches the ordering the regular agent path uses.
         let _ = relay_handle.await;
+
+        // Flip session status idle so the sidebar's "running" badge clears.
+        // Regular run_agent_turn does this in its monitor task right after
+        // relay_handle.await; we mirror that here.
+        let _ = tokio::task::spawn_blocking({
+            let db_for_status = Arc::clone(&db_for_task);
+            let sid = session_id_for_task.clone();
+            move || db_for_status.set_session_status(&sid, "idle")
+        })
+        .await;
+
         on_complete();
+    });
+
+    Ok(())
+}
+
+/// Spawn a fresh executor that picks up where a saved `auto_runs` snapshot
+/// left off. Used by `agent_approve_auto_plan`'s fallback path when a user
+/// clicks Run on an `awaiting_approval` panel after the original executor
+/// task is gone (app restart, crash). The saved plan is reused; the
+/// orchestrator is NOT called on the first iteration. Replans inside the
+/// resumed run go through the orchestrator normally.
+///
+/// Duplicates most of `run_auto_turn`'s body for now — both should be
+/// folded into a shared `spawn_auto_executor` helper in a follow-up.
+/// What kind of resume this is — drives how the executor's first iteration
+/// behaves. `ApproveSavedPlan` is the original P7 awaiting_approval resume;
+/// the two `Retry…` and `Replan…` variants are P9c's user-driven worker
+/// failure recovery.
+#[derive(Debug, Clone)]
+pub(crate) enum ResumeAction {
+    /// User clicked Run on the saved awaiting_approval plan. Executor uses
+    /// `plan_versions.last()` as-is and runs from worker[0] forward.
+    ApproveSavedPlan,
+    /// User clicked Retry on the awaiting_failure_decision banner. Executor
+    /// uses the saved plan; the worker loop skips ahead to `worker_id`
+    /// instead of starting at index 0.
+    RetryWorker { worker_id: String },
+    /// User clicked Replan on the awaiting_failure_decision banner. Executor
+    /// invokes the orchestrator on iteration 1 with `reason` baked into the
+    /// replan prompt (saved plan ignored, prior worker results preserved).
+    ReplanAfterFailure { reason: String },
+}
+
+async fn resume_auto_turn(
+    app_handle: AppHandle,
+    app_state: &AppState,
+    agent_state: &AgentState,
+    snapshot: AutoRun,
+    action: ResumeAction,
+) -> Result<(), String> {
+    let session_id = snapshot.session_id.clone();
+    let auto_run_id = snapshot.id.clone();
+    log::info!(
+        "[Auto-P7] resume_auto_turn START session={} run={} plans={} workers={} action={:?}",
+        session_id, auto_run_id, snapshot.plan_versions.len(), snapshot.worker_results.len(), action
+    );
+    // Translate the high-level ResumeAction into the executor's lower-level
+    // start_at_worker_id / initial_replan_reason fields.
+    let (resume_start_at_worker_id, resume_initial_replan_reason) = match &action {
+        ResumeAction::ApproveSavedPlan => (None, None),
+        ResumeAction::RetryWorker { worker_id } => (Some(worker_id.clone()), None),
+        ResumeAction::ReplanAfterFailure { reason } => (None, Some(reason.clone())),
+    };
+
+    // ── 1. Look up session (folder) + chat anchors ──
+    let db = Arc::clone(&agent_state.db);
+    let session_row = {
+        let sid = session_id.clone();
+        tokio::task::spawn_blocking(move || db.get_session(&sid))
+            .await
+            .map_err(|e| format!("join error: {e}"))?
+            .map_err(|e| format!("Failed to load session: {e}"))?
+            .ok_or_else(|| format!("Session {session_id} not found"))?
+    };
+    let folder = session_row.folder.clone();
+    let db = Arc::clone(&agent_state.db);
+    let assistant_row_id = {
+        let run_id_clone = auto_run_id.clone();
+        tokio::task::spawn_blocking(move || db.find_auto_assistant_row_id(&run_id_clone))
+            .await
+            .map_err(|e| format!("join error: {e}"))?
+            .map_err(|e| format!("Failed to look up assistant row: {e}"))?
+            .ok_or_else(|| format!("No assistant anchor row for run_id={auto_run_id}"))?
+    };
+    let db = Arc::clone(&agent_state.db);
+    let task = {
+        let run_id_clone = auto_run_id.clone();
+        tokio::task::spawn_blocking(move || db.find_auto_user_prompt(&run_id_clone))
+            .await
+            .map_err(|e| format!("join error: {e}"))?
+            .map_err(|e| format!("Failed to look up user prompt: {e}"))?
+            .ok_or_else(|| format!("No user prompt found for run_id={auto_run_id}"))?
+    };
+
+    // ── 2. Validate Auto settings still configured ──
+    let settings = read_auto_settings(app_state);
+    let Some(orchestrator_ref) = settings.orchestrator else {
+        return Err("Resume: orchestrator model not configured in Settings → Auto".into());
+    };
+    if settings.worker_pool.is_empty() {
+        return Err("Resume: worker pool is empty in Settings → Auto".into());
+    }
+    let orchestrator_provider = super::commands::provider_by_id_pub(app_state, &orchestrator_ref.provider_id)
+        .ok_or_else(|| format!("Resume: orchestrator provider `{}` is not configured", orchestrator_ref.provider_id))?;
+
+    // ── 3. Build LLM + context engine + worker context (same as run_auto_turn) ──
+    let mut orchestrator_llm = provider_to_llm_config(&orchestrator_provider, &orchestrator_ref.model);
+    orchestrator_llm.disable_cache_control = true;
+    let worker_llm_configs = build_worker_llm_configs(app_state, &settings.worker_pool)?;
+    log::info!(
+        "[Auto-P7] resume built worker_llm_configs ({} models): {:?}",
+        worker_llm_configs.len(),
+        worker_llm_configs.keys().collect::<Vec<_>>()
+    );
+
+    let ce_settings = super::commands::read_context_engine(app_state);
+    let ce_for_workers: Option<Arc<dyn agent::context_engine::ContextEngineApi>> =
+        if ce_settings.enabled {
+            let cfg = agent::context_engine::ContextEngineConfig {
+                base_url: super::commands::normalize_base_url(&ce_settings.base_url),
+                user_id: "local".to_string(),
+                workspace_id: 0,
+                machine_id: super::commands::machine_id(app_state),
+                repo_path: folder.clone(),
+                auth_token: String::new(),
+            };
+            Some(Arc::new(agent::context_engine::ContextEngineClient::new(cfg)))
+        } else { None };
+    let ce_repo_path: Option<PathBuf> =
+        if ce_settings.enabled { Some(PathBuf::from(&folder)) } else { None };
+    if ce_settings.enabled {
+        let wm = app_handle
+            .state::<Arc<crate::context_watcher::WatcherManager>>()
+            .inner()
+            .clone();
+        let folder_owned = folder.clone();
+        tokio::spawn(async move {
+            if let Err(e) = wm.start_watching(&folder_owned).await {
+                log::warn!("[ContextWatcher] start_watching failed for {folder_owned}: {e}");
+            }
+        });
+    }
+
+    // ── 4. Folder lock (one active session per folder) ──
+    {
+        let mut running = agent_state.running_folders.write().await;
+        if running.contains(&folder) {
+            return Err(format!("A session is already running for {folder}"));
+        }
+        running.insert(folder.clone());
+    }
+    let running_for_release = Arc::clone(&agent_state.running_folders);
+    let folder_for_release = folder.clone();
+    let release_folder = move || {
+        let running = running_for_release;
+        let folder = folder_for_release;
+        tokio::spawn(async move {
+            running.write().await.remove(&folder);
+        });
+    };
+
+    // ── 5. Event channel + relay ──
+    let (event_tx, event_rx) = mpsc::channel::<agent::types::AgentEvent>(256);
+    let emitter: Arc<dyn EventEmitter> = Arc::new(TauriEventEmitter::new(app_handle.clone()));
+    let relay_handle = spawn_event_relay(
+        emitter,
+        event_rx,
+        session_id.clone(),
+        Some(Arc::clone(&agent_state.db)),
+        folder.clone(),
+        None,
+    );
+
+    // ── 6. Worker context + pipeline ──
+    let work_dir = PathBuf::from(&folder);
+    let cancel = CancellationToken::new();
+
+    let worker_ctx = WorkerContext {
+        session_id: session_id.clone(),
+        run_id: auto_run_id.clone(),
+        working_dir: work_dir.clone(),
+        event_tx: event_tx.clone(),
+        cancel_token: cancel.clone(),
+        worker_llm_configs,
+        retry_config: RetryConfig::auto_worker(),
+        compaction_config: CompactionConfig::default(),
+        compaction_llm: None,
+        max_iterations: 100,
+        context_engine: ce_for_workers,
+        context_engine_repo_path: ce_repo_path,
+        persister: None,
+        approval_handler: None,
+        checkpoint_dir: None,
+    };
+
+    let plan_gen = Arc::new(LlmPlanGenerator { llm: orchestrator_llm });
+    let runner = Arc::new(LiveWorkerRunner { ctx: worker_ctx });
+    // Resume = user already approved by clicking Run on the panel.
+    let approver: Arc<dyn PlanApprover> = Arc::new(agent::auto::AutoApprove);
+
+    let exec_config = ExecutorConfig {
+        task,
+        auto_run_id: auto_run_id.clone(),
+        session_id: session_id.clone(),
+        worker_pool: settings.worker_pool,
+        replan_budget: AUTO_REPLAN_BUDGET,
+        resume_from: Some(snapshot),
+        // Default resume = AwaitingApproval flow (user clicked Run on the
+        // saved plan). P9c overrides these when resuming after a worker
+        // failure: RetryWorker sets start_at_worker_id, ReplanAfterFailure
+        // sets initial_replan_reason. See `resume_auto_turn`'s callers.
+        start_at_worker_id: resume_start_at_worker_id,
+        initial_replan_reason: resume_initial_replan_reason,
+    };
+
+    // Register cancel token + state listener.
+    agent_state
+        .auto_cancellation
+        .lock()
+        .unwrap()
+        .insert(session_id.clone(), cancel.clone());
+    let state_listener: Option<Arc<dyn AutoStateListener>> = Some(Arc::new(DbAutoStateListener::new(
+        Arc::clone(&agent_state.db),
+    )));
+
+    // ── 7. Spawn executor (terminal handler mirrors run_auto_turn) ──
+    let event_tx_for_cancel = event_tx.clone();
+    let db_for_task = Arc::clone(&agent_state.db);
+    let pending_for_cancel = Arc::clone(&agent_state.auto_plan_pending);
+    let cancel_registry = Arc::clone(&agent_state.auto_cancellation);
+    let auto_run_id_for_task = auto_run_id.clone();
+    let session_id_for_task = session_id.clone();
+
+    tokio::spawn(async move {
+        let result = auto::run_auto(
+            exec_config, event_tx, plan_gen, runner, approver, cancel, state_listener,
+        )
+        .await;
+        log::info!(
+            "[Auto-P7] resume executor returned: run={} variant={}",
+            auto_run_id_for_task,
+            match &result {
+                AutoResult::Done { .. } => "Done",
+                AutoResult::Failed { .. } => "Failed",
+                AutoResult::Cancelled { .. } => "Cancelled",
+            }
+        );
+
+        let final_run = match &result {
+            AutoResult::Done { run, .. }
+            | AutoResult::Failed { run, .. }
+            | AutoResult::Cancelled { run } => run.clone(),
+        };
+        let _ = tokio::task::spawn_blocking({
+            let db = Arc::clone(&db_for_task);
+            let r = final_run.clone();
+            move || db.update_auto_run(&r)
+        })
+        .await;
+
+        let summary_text = match &result {
+            AutoResult::Done { summary, .. } => summary.clone(),
+            AutoResult::Failed { reason, .. } => format!("Auto run failed: {reason}"),
+            AutoResult::Cancelled { .. } => "Auto run interrupted by user".to_string(),
+        };
+        update_auto_assistant_summary(
+            Arc::clone(&db_for_task),
+            assistant_row_id,
+            &summary_text,
+        )
+        .await;
+
+        if matches!(&result, AutoResult::Cancelled { .. }) {
+            let _ = event_tx_for_cancel
+                .send(agent::types::AgentEvent::AutoFailed {
+                    session_id: session_id_for_task.clone(),
+                    run_id: auto_run_id_for_task.clone(),
+                    reason: "Interrupted by user".to_string(),
+                    last_worker_output: None,
+                })
+                .await;
+        }
+        drop(event_tx_for_cancel);
+
+        pending_for_cancel.lock().unwrap().remove(&auto_run_id_for_task);
+        cancel_registry.lock().unwrap().remove(&session_id_for_task);
+
+        let _ = relay_handle.await;
+
+        let _ = tokio::task::spawn_blocking({
+            let db = Arc::clone(&db_for_task);
+            let sid = session_id_for_task.clone();
+            move || db.set_session_status(&sid, "idle")
+        })
+        .await;
+
+        release_folder();
     });
 
     Ok(())
@@ -523,8 +1293,6 @@ mod tests {
         let s = read_auto_settings(&state);
         assert!(s.orchestrator.is_none());
         assert!(s.worker_pool.is_empty());
-        assert_eq!(s.replan_budget, DEFAULT_REPLAN_BUDGET);
-        assert_eq!(DEFAULT_REPLAN_BUDGET, 2, "default budget pinned by PHASE_AUTO_MODE.md");
     }
 
     // ── orchestrator round-trip ──
@@ -588,28 +1356,10 @@ mod tests {
         assert!(read_auto_worker_pool(&state).is_empty());
     }
 
-    // ── replan budget round-trip ──
-
-    #[test]
-    fn replan_budget_writes_then_reads_unchanged() {
-        let state = mk_app_state();
-        state.db.set_setting(AUTO_REPLAN_BUDGET_KEY, "5").unwrap();
-        assert_eq!(read_auto_replan_budget(&state), 5);
-        state.db.set_setting(AUTO_REPLAN_BUDGET_KEY, "0").unwrap();
-        assert_eq!(read_auto_replan_budget(&state), 0);
-    }
-
-    #[test]
-    fn replan_budget_defaults_when_unparseable() {
-        let state = mk_app_state();
-        state.db.set_setting(AUTO_REPLAN_BUDGET_KEY, "garbage").unwrap();
-        assert_eq!(read_auto_replan_budget(&state), DEFAULT_REPLAN_BUDGET);
-    }
-
     // ── composite read_auto_settings ──
 
     #[test]
-    fn read_auto_settings_assembles_all_four_keys() {
+    fn read_auto_settings_assembles_all_keys() {
         let state = mk_app_state();
         let model = ModelRef {
             provider_id: "anthropic".into(),
@@ -628,7 +1378,6 @@ mod tests {
             .db
             .set_setting(AUTO_WORKER_POOL_KEY, &serde_json::to_string(&pool).unwrap())
             .unwrap();
-        state.db.set_setting(AUTO_REPLAN_BUDGET_KEY, "3").unwrap();
         state.db.set_setting(AUTO_ENABLED_KEY, "true").unwrap();
 
         let s = read_auto_settings(&state);
@@ -636,7 +1385,6 @@ mod tests {
         assert!(s.orchestrator.is_some());
         assert_eq!(s.orchestrator.unwrap().model, "claude-sonnet-4-6");
         assert_eq!(s.worker_pool.len(), 1);
-        assert_eq!(s.replan_budget, 3);
     }
 
     // ── enabled flag ──
