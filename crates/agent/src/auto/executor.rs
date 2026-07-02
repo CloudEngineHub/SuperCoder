@@ -360,9 +360,34 @@ pub async fn run(
         // P9c: RetryWorker resume — skip past workers that already
         // completed; start at the one the user asked to retry. Only applies
         // on the first plan iteration; subsequent replans always start at
-        // index 0 of the new plan (Option::take clears the binding).
+        // index 0 of the new plan (Option::take clears the binding). If the
+        // target id isn't in the saved plan (shouldn't happen — the plan is
+        // the same snapshot the user retried from), fail loudly instead of
+        // silently restarting all workers from index 0, which replays every
+        // completed worker and poisons debugging.
         let start_idx = if let Some(target_id) = start_at_worker_id.take() {
-            plan.workers.iter().position(|w| w.id == target_id).unwrap_or(0)
+            match plan.workers.iter().position(|w| w.id == target_id) {
+                Some(idx) => idx,
+                None => {
+                    let reason = format!(
+                        "Retry target worker id `{target_id}` not found in saved plan (plan has: {})",
+                        plan.workers
+                            .iter()
+                            .map(|w| w.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                    return finalize_failed(
+                        auto_run,
+                        &event_tx,
+                        &config,
+                        reason,
+                        None,
+                        &notify,
+                    )
+                    .await;
+                }
+            }
         } else {
             0
         };
@@ -963,6 +988,44 @@ mod tests {
         }
         assert!(runner.invocations().is_empty(), "runner must not be invoked on rejection");
         assert!(events.iter().any(|e| matches!(e, AgentEvent::AutoFailed { .. })));
+    }
+
+    #[tokio::test]
+    async fn retry_target_worker_id_missing_from_plan_fails_loudly() {
+        // P9c: RetryWorker resume where the target id isn't in the saved
+        // plan must fail with a clear diagnostic — not silently restart
+        // from index 0, which would replay every completed worker.
+        let saved_plan = plan(1, &["w1", "w2"]);
+        let saved_snapshot = AutoRun {
+            id: "auto-run-test".into(),
+            session_id: "sess-test".into(),
+            status: AutoStatus::AwaitingFailureDecision,
+            plan_versions: vec![saved_plan.clone()],
+            worker_results: vec![worker_ok("w1", "done")],
+            cost_cents: 5,
+            replans_used: 0,
+            current_worker: None,
+            pending_failure: None,
+        };
+        let plan_gen = Arc::new(MockPlanGen::new(vec![])); // orchestrator must NOT be called
+        let runner = Arc::new(MockRunner::new());
+
+        let (mut config, tx, rx) = cfg(2);
+        config.resume_from = Some(saved_snapshot);
+        config.start_at_worker_id = Some("w-does-not-exist".into());
+
+        let result = run(config, tx, plan_gen.clone(), runner.clone(), Arc::new(AutoApprove), CancellationToken::new(), None).await;
+        let _ = drain(rx).await;
+
+        match result {
+            AutoResult::Failed { reason, .. } => {
+                assert!(reason.contains("w-does-not-exist"), "reason must name the missing id: {reason}");
+                assert!(reason.contains("not found"), "reason must say not found: {reason}");
+            }
+            other => panic!("expected Failed on missing retry target, got {other:?}"),
+        }
+        assert!(runner.invocations().is_empty(), "no worker should run when retry target is missing");
+        assert_eq!(plan_gen.call_count(), 0, "orchestrator must not be called on a resume");
     }
 
     #[tokio::test]
