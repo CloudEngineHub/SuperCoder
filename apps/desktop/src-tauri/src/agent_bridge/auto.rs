@@ -1199,6 +1199,16 @@ async fn resume_auto_turn(
         });
     };
 
+    // Flip the session to `active` so the sidebar shows the running badge
+    // for Retry/Replan/restart-resume — mirrors what `run_auto_turn` does
+    // for fresh runs. Without this, the resumed executor spins in the
+    // background but the session row still reads "idle" in the DB.
+    {
+        let db = Arc::clone(&agent_state.db);
+        let sid = session_id.clone();
+        let _ = tokio::task::spawn_blocking(move || db.set_session_status(&sid, "active")).await;
+    }
+
     // ── 5. Event channel + relay ──
     let (event_tx, event_rx) = mpsc::channel::<agent::types::AgentEvent>(256);
     let emitter: Arc<dyn EventEmitter> = Arc::new(TauriEventEmitter::new(app_handle.clone()));

@@ -473,19 +473,20 @@ async fn finalize_awaiting_failure_decision(
 ) -> AutoResult {
     let reason = failure.error_message.clone();
     run.status = AutoStatus::AwaitingFailureDecision;
-    run.pending_failure = Some(failure);
+    run.pending_failure = Some(failure.clone());
     notify(&run);
-    // Reuse the existing AutoFailed event channel — the frontend will read
-    // the snapshot's `pending_failure` field via hydration to know it's
-    // user-recoverable (vs. a terminally-Failed run). Avoids adding yet
-    // another event variant + 4-tier UI dispatch.
+    // Emit a dedicated event carrying the failure context inline. Previously
+    // we reused `AutoFailed` and had the frontend refetch the snapshot to
+    // read `pending_failure` — but the DB write via `notify` is fire-and-
+    // forget through an mpsc + spawn_blocking, so it raced with the
+    // frontend's read and the amber recovery banner sometimes never
+    // appeared. Inlining the context removes the round-trip.
     emit(
         event_tx,
-        AgentEvent::AutoFailed {
+        AgentEvent::AutoAwaitingFailureDecision {
             session_id: config.session_id.clone(),
             run_id: config.auto_run_id.clone(),
-            reason: reason.clone(),
-            last_worker_output: None,
+            failure,
         },
     )
     .await;
@@ -754,14 +755,19 @@ mod tests {
         )
     }
 
-    /// Collect events until terminal (AutoDone or AutoFailed) or a timeout.
+    /// Collect events until terminal (AutoDone, AutoFailed, or
+    /// AutoAwaitingFailureDecision) or a timeout.
     async fn drain(mut rx: mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
         let mut out = Vec::new();
         while let Ok(Some(ev)) =
             tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
         {
-            let terminal =
-                matches!(ev, AgentEvent::AutoDone { .. } | AgentEvent::AutoFailed { .. });
+            let terminal = matches!(
+                ev,
+                AgentEvent::AutoDone { .. }
+                    | AgentEvent::AutoFailed { .. }
+                    | AgentEvent::AutoAwaitingFailureDecision { .. }
+            );
             out.push(ev);
             if terminal {
                 break;
@@ -908,7 +914,12 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::AutoFailed { .. })));
+        // Budget-exhausted worker failure emits AutoAwaitingFailureDecision
+        // (not AutoFailed) so the frontend can render the amber recovery
+        // banner without a snapshot refetch race.
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AutoAwaitingFailureDecision { .. })));
     }
 
     #[tokio::test]

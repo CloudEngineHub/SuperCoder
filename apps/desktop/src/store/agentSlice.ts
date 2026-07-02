@@ -202,6 +202,13 @@ export interface AgentSlice {
     summary: string,
   ) => void;
   setAutoReplan: (runId: string, reason: string) => void;
+  /** Transition to the paused-for-user-decision state. Called from the
+   *  `agent:auto_awaiting_failure_decision` handler with the failure carried
+   *  inline on the event, so no DB refetch is needed. */
+  setAutoAwaitingFailureDecision: (
+    runId: string,
+    failure: WorkerFailureContext,
+  ) => void;
   setAutoFailed: (
     runId: string,
     reason: string,
@@ -622,6 +629,28 @@ export const createAgentSlice: StateCreator<AgentSlice, [], [], AgentSlice> = (s
             ...current,
             status: 'replanning',
             replanReason: reason,
+          },
+        },
+      };
+    }),
+
+  setAutoAwaitingFailureDecision: (runId, failure) =>
+    set((s) => {
+      const current = s.autoRuns[runId];
+      if (!current) return s;
+      return {
+        autoRuns: {
+          ...s.autoRuns,
+          [runId]: {
+            ...current,
+            status: 'awaiting_failure_decision',
+            pendingFailure: failure,
+            // The failed worker's summary was already appended to
+            // workerResults by the preceding AutoWorkerEnd event; clear the
+            // in-flight card so the panel doesn't show a running spinner
+            // over the amber banner.
+            currentWorker: null,
+            currentWorkerTools: [],
           },
         },
       };

@@ -462,6 +462,14 @@ export interface AutoReplanEvent {
   run_id: string;
   reason: string;
 }
+/** Executor paused: worker hard-failed and the user's choice is required.
+ *  Carries the failure context inline so the panel can transition straight
+ *  to the amber Retry/Replan/Cancel banner — no snapshot refetch needed. */
+export interface AutoAwaitingFailureDecisionEvent {
+  thread_id: string;
+  run_id: string;
+  failure: WorkerFailureContext;
+}
 export interface AutoFailedEvent {
   thread_id: string;
   run_id: string;

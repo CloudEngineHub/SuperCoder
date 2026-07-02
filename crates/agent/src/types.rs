@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::auto::{WorkerSpec, WorkerStatus};
+use crate::auto::{WorkerFailureContext, WorkerSpec, WorkerStatus};
 
 /// Events emitted by the agent loop for UI consumption.
 #[derive(Debug, Clone, Serialize)]
@@ -187,6 +187,17 @@ pub enum AgentEvent {
         reason: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         last_worker_output: Option<String>,
+    },
+    /// Auto: worker hard-failed and the run is paused awaiting the user's
+    /// Retry / Replan / Cancel decision. Carries the full `WorkerFailureContext`
+    /// inline so the frontend can render the amber recovery banner without a
+    /// DB round-trip (the persisted snapshot's `pending_failure` write races
+    /// with the event delivery). Terminal for the current executor task; the
+    /// user's choice spawns a fresh executor via `agent_resolve_worker_failure`.
+    AutoAwaitingFailureDecision {
+        session_id: String,
+        run_id: String,
+        failure: WorkerFailureContext,
     },
     /// Auto: all workers finished successfully (possibly after replans).
     AutoDone {

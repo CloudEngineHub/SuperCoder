@@ -580,6 +580,25 @@ async fn relay_event(
             );
             true
         }
+        AgentEvent::AutoAwaitingFailureDecision {
+            run_id, failure, ..
+        } => {
+            // Terminal for the current executor task — the run is paused and
+            // Retry/Replan/Cancel spawns a fresh executor via
+            // `agent_resolve_worker_failure`. Carrying `failure` inline lets
+            // the frontend transition straight to the amber banner without
+            // refetching the snapshot (which raced with the DB write).
+            emit_or_log(
+                ctx.emitter.as_ref(),
+                "agent:auto_awaiting_failure_decision",
+                serde_json::json!({
+                    "thread_id": tid,
+                    "run_id": run_id,
+                    "failure": failure,
+                }),
+            );
+            true
+        }
         AgentEvent::AutoDone {
             run_id,
             summary,

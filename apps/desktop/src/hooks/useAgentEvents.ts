@@ -6,6 +6,7 @@ import { agentTauriService } from "@/services/agentTauriService";
 import { parseThinkingMarkers, buildAgentMessage, buildThinkingMeta, displayToAgentMessage } from "@/utils/agentMessageAdapter";
 import type {
   AutoAwaitingApprovalEvent,
+  AutoAwaitingFailureDecisionEvent,
   AutoDoneEvent,
   AutoFailedEvent,
   AutoPlanEvent,
@@ -503,24 +504,32 @@ export function useAgentEvents() {
         // the regular `agent:done` handler does for normal sessions.
         store.softClearAgentStreaming(thread_id);
         clearApprovalsForSession(thread_id);
-        // P9c: AutoFailed is reused for the new "pause for user decision"
-        // path too — refetch the snapshot to see if pending_failure is set,
-        // and if so, re-hydrate to awaiting_failure_decision state so the
-        // panel renders the Retry / Replan / Cancel banner.
-        agentTauriService
-          .getAutoRun(run_id)
-          .then((snapshot) => {
-            if (snapshot?.pending_failure) {
-              console.info("[Auto-P7] auto_failed has pending_failure → switching to awaiting_failure_decision");
-              // Clear the now-incorrect 'failed' state and re-hydrate from
-              // the snapshot (hydrateAutoRun maps awaiting_failure_decision
-              // and populates pendingFailure).
-              useAppStore.getState().clearAutoRun(run_id);
-              useAppStore.getState().hydrateAutoRun(snapshot);
-            }
-          })
-          .catch((e) => console.warn("[Auto-P7] post-auto_failed snapshot fetch failed:", e));
       }),
+    );
+    listeners.push(
+      listen<AutoAwaitingFailureDecisionEvent>(
+        "agent:auto_awaiting_failure_decision",
+        (event) => {
+          const { thread_id, run_id, failure } = event.payload;
+          console.info(
+            "[Auto-P7] evt auto_awaiting_failure_decision session=%s run=%s worker=%s",
+            thread_id, run_id, failure.worker_id,
+          );
+          const store = useAppStore.getState();
+          // Failure context is inline on the event, so we transition
+          // straight to the amber banner without a snapshot refetch. This
+          // closes the race where the DB write for `pending_failure`
+          // (fire-and-forget via mpsc + spawn_blocking) lost to the
+          // frontend's read, leaving the panel stuck on the red terminal
+          // banner with no recovery controls.
+          store.setAutoAwaitingFailureDecision(run_id, failure);
+          // Terminal for the executor task — mirror the housekeeping the
+          // regular terminal handlers do so the "Thinking…" placeholder +
+          // any lingering approvals get cleared.
+          store.softClearAgentStreaming(thread_id);
+          clearApprovalsForSession(thread_id);
+        },
+      ),
     );
     listeners.push(
       listen<AutoDoneEvent>("agent:auto_done", (event) => {
