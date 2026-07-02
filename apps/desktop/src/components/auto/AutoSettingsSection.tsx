@@ -6,11 +6,25 @@ import { useAppStore } from '@/store';
 import type {
   AutoSettings,
   ModelRef,
+  ProviderConfig,
   SessionRow,
   WorkerPoolEntry,
 } from '@/types/agent';
 import AddWorkerDialog from './AddWorkerDialog';
 import DisableConfirmModal from './DisableConfirmModal';
+
+/** Same shape used by ModelPicker + Settings page. Keep in sync when
+ * refactoring — a shared helper would be nicer but isn't wired yet. */
+function providerName(p: ProviderConfig): string {
+  if (p.kind === 'openai') return 'OpenAI';
+  if (p.kind === 'anthropic') return 'Anthropic';
+  if (p.label?.trim()) return p.label.trim();
+  try {
+    return new URL(p.baseUrl).host || 'OpenAI-compatible';
+  } catch {
+    return 'OpenAI-compatible';
+  }
+}
 
 /**
  * "Auto" Settings section. Sits at the end of the Settings page (after
@@ -283,7 +297,17 @@ export default function AutoSettingsSection() {
             </div>
           ) : (
             <div className="border border-[var(--border)] rounded-md divide-y divide-[var(--border)]">
-              {settings.workerPool.map((entry, idx) => (
+              {settings.workerPool.map((entry, idx) => {
+                // Resolve the pool entry's providerId to its friendly name.
+                // Falls back to a marker + the raw id if the underlying
+                // provider was deleted after the entry was added (rare —
+                // AutoRunTurn's build_worker_llm_configs will fail-fast on
+                // this too so the user sees a clear error at run time).
+                const provider = providers.find((p) => p.id === entry.providerId);
+                const providerLabel = provider
+                  ? providerName(provider)
+                  : `(unknown provider ${entry.providerId.slice(0, 8)}…)`;
+                return (
                 <div key={`${entry.providerId}-${entry.model}`} className="p-3">
                   <div className="flex items-start justify-between gap-3 mb-2">
                     <div className="flex-1 min-w-0">
@@ -291,7 +315,7 @@ export default function AutoSettingsSection() {
                         {entry.model}
                       </div>
                       <div className="text-xs text-[var(--text-secondary)]">
-                        {entry.providerId}
+                        {providerLabel}
                       </div>
                     </div>
                     <Tooltip title="Remove from pool">
@@ -319,7 +343,8 @@ export default function AutoSettingsSection() {
                     placeholder="When should the orchestrator pick this model?"
                   />
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
           <Button
