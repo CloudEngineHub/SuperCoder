@@ -72,11 +72,14 @@ export default function ModelPicker() {
   );
 
   // Flatten providers → models as grouped dropdown items (header + model rows).
-  // When Auto is enabled in Settings, a magic ✨ entry sits at the top with a
-  // divider before the first regular provider.
+  // When Auto is enabled in Settings AND the open session is in Code mode,
+  // a magic ✨ entry sits at the top with a divider before the first regular
+  // provider. Auto is scoped to Code because the orchestrator-of-workers
+  // pattern is code-execution-oriented; Plan/Ask surfaces stay picker-only.
+  const showAuto = autoEnabled && openSession?.mode === "coding";
   const dropdownItems: CustomDropdownItem[] = useMemo(() => {
     const items: CustomDropdownItem[] = [];
-    if (autoEnabled) {
+    if (showAuto) {
       items.push({
         key: `${AUTO_SENTINEL_PROVIDER_ID}::${AUTO_SENTINEL_MODEL}`,
         label: "Auto",
@@ -97,7 +100,7 @@ export default function ModelPicker() {
         label: providerName(p),
         disabled: true,
         // Visual break between the Auto entry and the regular providers.
-        dividerBefore: autoEnabled && firstProviderHeader,
+        dividerBefore: showAuto && firstProviderHeader,
       });
       firstProviderHeader = false;
       for (const m of p.models) {
@@ -110,7 +113,7 @@ export default function ModelPicker() {
       }
     }
     return items;
-  }, [autoEnabled, providers, handleSelect]);
+  }, [showAuto, providers, handleSelect]);
 
   // Active model resolution. Auto sentinel is shown as "✨ Auto" (we never
   // want the literal sentinel string to leak into the chip).

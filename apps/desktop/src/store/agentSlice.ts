@@ -11,6 +11,7 @@ import type {
   WorkerResult,
   WorkerSpec,
 } from '../types/agent';
+import { AUTO_SENTINEL_MODEL, AUTO_SENTINEL_PROVIDER_ID } from '../types/agent';
 import type { PendingApproval, TodoItem } from '../types/agentContract';
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -434,6 +435,24 @@ export const createAgentSlice: StateCreator<AgentSlice, [], [], AgentSlice> = (s
     const active = get().selection.active;
     if (!active) {
       set({ activeCapability: null });
+      return;
+    }
+    // Auto sentinel isn't a real provider — the backend resolver would 404.
+    // Workers are full AgentLoops running whatever model the orchestrator
+    // picks, some of which support images. Report vision-capable so the
+    // attach affordances stay visible; the actual per-worker vision check
+    // is redundant because the orchestrator routes images to a vision model.
+    if (
+      active.providerId === AUTO_SENTINEL_PROVIDER_ID &&
+      active.model === AUTO_SENTINEL_MODEL
+    ) {
+      set({
+        activeCapability: {
+          contextLimit: null,
+          supportsImages: true,
+          source: 'auto',
+        },
+      });
       return;
     }
     try {

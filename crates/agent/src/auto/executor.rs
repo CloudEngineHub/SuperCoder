@@ -287,7 +287,8 @@ pub async fn run(
             notify(&auto_run);
 
             if cancel.is_cancelled() {
-                return finalize_cancelled(auto_run, &notify);
+                let phase = planning_phase_label(&auto_run);
+                return finalize_cancelled(auto_run, phase, &notify);
             }
 
             let req = OrchestratorRequest {
@@ -298,9 +299,10 @@ pub async fn run(
                 plan_version: current_version,
             };
 
+            let phase_for_cancel = planning_phase_label(&auto_run);
             let p = match plan_gen.generate(&req, Some(&cancel)).await {
                 Ok(p) => p,
-                Err(OrchestratorError::Cancelled) => return finalize_cancelled(auto_run, &notify),
+                Err(OrchestratorError::Cancelled) => return finalize_cancelled(auto_run, phase_for_cancel, &notify),
                 Err(e) => {
                     let reason = format!("orchestrator error: {e}");
                     return finalize_failed(auto_run, &event_tx, &config, reason, None, &notify).await;
@@ -338,7 +340,10 @@ pub async fn run(
 
             let approved = tokio::select! {
                 a = approver.approve(&plan) => a,
-                _ = cancel.cancelled() => return finalize_cancelled(auto_run, &notify),
+                _ = cancel.cancelled() => {
+                    let phase = format!("Approval for plan v{}", plan.version);
+                    return finalize_cancelled(auto_run, phase, &notify);
+                }
             };
             if !approved {
                 let reason = "plan rejected by user".to_string();
@@ -364,7 +369,8 @@ pub async fn run(
 
         for spec in plan.workers.iter().skip(start_idx) {
             if cancel.is_cancelled() {
-                return finalize_cancelled(auto_run, &notify);
+                let phase = format!("Worker {} ({})", spec.id, spec.model);
+                return finalize_cancelled(auto_run, phase, &notify);
             }
 
             // Mark this worker as in flight BEFORE we block on its execution
@@ -381,8 +387,9 @@ pub async fn run(
             auto_run.current_worker = None;
 
             if result.status == WorkerStatus::Cancelled {
+                let phase = format!("Worker {} ({})", spec.id, spec.model);
                 auto_run.worker_results.push(result);
-                return finalize_cancelled(auto_run, &notify);
+                return finalize_cancelled(auto_run, phase, &notify);
             }
 
             if result.status.is_hard_failure() {
@@ -533,14 +540,20 @@ async fn finalize_failed(
     AutoResult::Failed { reason, run }
 }
 
-fn finalize_cancelled(mut run: AutoRun, notify: &dyn Fn(&AutoRun)) -> AutoResult {
+fn finalize_cancelled(
+    mut run: AutoRun,
+    phase: String,
+    notify: &dyn Fn(&AutoRun),
+) -> AutoResult {
     run.status = AutoStatus::Cancelled;
     notify(&run);
     // No AgentEvent::AutoCancelled in the enum; the UI infers cancel from the
     // user's Cancel click. We could re-purpose AutoFailed with reason
     // "cancelled" if downstream surfaces need an explicit signal — for now,
     // returning the result is enough; AutoRun.status carries the state.
-    AutoResult::Cancelled { run }
+    // `phase` captures what was happening when cancel fired so the persisted
+    // assistant summary can name it (Planning vN, Worker wN, etc.).
+    AutoResult::Cancelled { run, phase }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -565,6 +578,19 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max).collect();
         format!("{truncated}…")
+    }
+}
+
+/// Label for the current planning attempt. First plan → "Planning vN";
+/// any subsequent iteration (user- or auto-replan) → "Replanning vN".
+/// Called at cancel sites in the planning branch so the persisted summary
+/// tells the user exactly what was interrupted.
+fn planning_phase_label(run: &AutoRun) -> String {
+    let version = run.plan_versions.len() + 1;
+    if run.plan_versions.is_empty() {
+        format!("Planning v{version}")
+    } else {
+        format!("Replanning v{version}")
     }
 }
 
@@ -963,10 +989,46 @@ mod tests {
         let result = run(config, tx, plan_gen, runner.clone(), Arc::new(AutoApprove), CancellationToken::new(), None).await;
 
         match result {
-            AutoResult::Cancelled { run } => {
+            AutoResult::Cancelled { run, phase } => {
                 assert_eq!(run.status, AutoStatus::Cancelled);
                 assert_eq!(run.worker_results.len(), 1, "only w1 ran before cancel");
                 assert_eq!(runner.invocations(), vec!["w1"]);
+                assert!(
+                    phase.starts_with("Worker w1"),
+                    "phase should name the cancelled worker, got {phase:?}"
+                );
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_during_second_worker_preserves_prior_success() {
+        // Two-worker plan: w1 completes cleanly, w2 gets cancelled. We assert
+        // both that w1's Ok result stays in worker_results (so a downstream
+        // Retry/Replan sees it as prior context) AND that the phase string
+        // names w2 specifically.
+        let plan_gen = Arc::new(MockPlanGen::new(vec![Ok(plan(1, &["w1", "w2"]))]));
+        let runner = Arc::new(MockRunner::new());
+        runner.enqueue("w1", worker_ok("w1", "explored the repo"));
+        runner.enqueue("w2", worker_fail("w2", WorkerStatus::Cancelled));
+
+        let (config, tx, _rx) = cfg(2);
+        let result = run(config, tx, plan_gen, runner.clone(), Arc::new(AutoApprove), CancellationToken::new(), None).await;
+
+        match result {
+            AutoResult::Cancelled { run, phase } => {
+                assert_eq!(run.status, AutoStatus::Cancelled);
+                assert_eq!(run.worker_results.len(), 2, "w1 Ok + w2 Cancelled both recorded");
+                assert_eq!(run.worker_results[0].id, "w1");
+                assert_eq!(run.worker_results[0].status, WorkerStatus::Ok);
+                assert_eq!(run.worker_results[1].id, "w2");
+                assert_eq!(run.worker_results[1].status, WorkerStatus::Cancelled);
+                assert!(
+                    phase.starts_with("Worker w2"),
+                    "phase should name w2 (the cancelled one), got {phase:?}"
+                );
+                assert_eq!(runner.invocations(), vec!["w1", "w2"]);
             }
             other => panic!("expected Cancelled, got {other:?}"),
         }
@@ -983,8 +1045,9 @@ mod tests {
         let result = run(config, tx, plan_gen.clone(), runner.clone(), Arc::new(AutoApprove), cancel, None).await;
 
         match result {
-            AutoResult::Cancelled { run } => {
+            AutoResult::Cancelled { run, phase } => {
                 assert!(run.plan_versions.is_empty(), "no plan should be generated");
+                assert_eq!(phase, "Planning v1", "first-plan cancel should tag Planning v1");
             }
             other => panic!("expected Cancelled with pre-fired token, got {other:?}"),
         }

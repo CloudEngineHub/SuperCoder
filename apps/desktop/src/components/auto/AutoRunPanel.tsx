@@ -158,11 +158,13 @@ function PendingFailureBanner({
       await agentTauriService.resolveWorkerFailure(runId, action);
     } catch (e) {
       toast.error(`${action} failed: ${e}`);
+    } finally {
+      // Always clear so the banner isn't stuck if the spawned executor
+      // crashes before emitting any event. On success the panel re-renders
+      // to the next status (running / failed) and this banner unmounts;
+      // on error the user can retry the action.
       setSubmitting(null);
     }
-    // On success the new executor (or DB update) drives state from here;
-    // no need to clear `submitting` because the panel will re-render via
-    // events / hydrate.
   };
   return (
     <div className="border border-amber-300 bg-amber-50 dark:border-amber-700 dark:bg-amber-900/20 rounded-lg p-3">

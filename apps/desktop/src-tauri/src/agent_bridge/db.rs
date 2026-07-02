@@ -1532,6 +1532,7 @@ mod tests {
             AutoStatus::Planning,
             AutoStatus::AwaitingApproval,
             AutoStatus::Running,
+            AutoStatus::AwaitingFailureDecision,
             AutoStatus::Done,
             AutoStatus::Failed,
             AutoStatus::Cancelled,

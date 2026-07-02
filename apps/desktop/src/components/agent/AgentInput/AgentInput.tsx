@@ -14,6 +14,7 @@ import SubagentsDialog from "../SubagentsDialog/SubagentsDialog";
 import { Segmented, Progress, Tooltip, Popover } from "antd";
 import { themedMessage } from "@/providers/AntDThemeProvider";
 import type { PermissionLevel, SubagentListEntry } from "@/types/agentContract";
+import { AUTO_SENTINEL_MODEL, AUTO_SENTINEL_PROVIDER_ID } from "@/types/agent";
 import type { Attachment } from "@/types/chat";
 import type { WidthTier } from "@/components/common/InputShell/types";
 import ModelPicker from "@/components/agent/ModelPicker/ModelPicker";
@@ -256,6 +257,43 @@ export default function AgentInput({ sessionId, folderPath, agentName = "the age
     (m: Mode) => {
       setMode(m);
       useAppStore.getState().setSessionMode(sessionId, m);
+      // Auto is Code-mode only. If the user switches away from Code while
+      // Auto is the selected model, silently revert to a real model so the
+      // next send doesn't dispatch through the orchestrator path (backend
+      // resolve_session_auto_mode would also block it, but we prefer a
+      // clean picker state over a surprise error).
+      if (m !== "coding") {
+        const store = useAppStore.getState();
+        const session = store.sessions.find((s) => s.id === sessionId);
+        const currentIsAuto =
+          session?.providerId === AUTO_SENTINEL_PROVIDER_ID &&
+          session?.model === AUTO_SENTINEL_MODEL;
+        if (currentIsAuto) {
+          // Prefer the global active selection when it isn't Auto itself;
+          // otherwise pick the first provider that has at least one model.
+          const active = store.selection.active;
+          const activeUsable =
+            active &&
+            !(active.providerId === AUTO_SENTINEL_PROVIDER_ID &&
+              active.model === AUTO_SENTINEL_MODEL);
+          const fallback = activeUsable
+            ? { providerId: active!.providerId, model: active!.model }
+            : (() => {
+                for (const p of store.providers) {
+                  if (
+                    p.id !== AUTO_SENTINEL_PROVIDER_ID &&
+                    p.models.length > 0
+                  ) {
+                    return { providerId: p.id, model: p.models[0] };
+                  }
+                }
+                return null;
+              })();
+          if (fallback) {
+            void store.setSessionModel(sessionId, fallback.providerId, fallback.model);
+          }
+        }
+      }
     },
     [sessionId],
   );

@@ -94,7 +94,10 @@ impl LlmPolicy {
 }
 
 /// Configuration for the LLM HTTP client.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually to redact `api_key` — accidental
+/// `{:?}` formatting in a log/panic/error must not leak credentials.
+#[derive(Clone)]
 pub struct LlmClientConfig {
     /// Which wire format to speak. Drives URL/header/request-build + SSE-parse.
     pub provider: Provider,
@@ -121,6 +124,23 @@ pub struct LlmClientConfig {
     /// Per-binary LLM transport behavior. Default = pooled HTTP/2 (app); `bench()` =
     /// HTTP/1.1, no pool, 15s header timeout (matches opencode).
     pub policy: LlmPolicy,
+}
+
+impl std::fmt::Debug for LlmClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmClientConfig")
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("api_key", &"[REDACTED]")
+            .field("temperature", &self.temperature)
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("extra_headers_count", &self.extra_headers.len())
+            .field("thinking", &self.thinking)
+            .field("disable_cache_control", &self.disable_cache_control)
+            .field("policy", &self.policy)
+            .finish()
+    }
 }
 
 /// HTTP client that speaks either OpenAI chat-completions or the Anthropic

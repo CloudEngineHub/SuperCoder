@@ -38,7 +38,7 @@ use uuid::Uuid;
 use agent::agent::config::{CompactionConfig, RetryConfig};
 use agent::auto::{
     self, AutoResult, AutoRun, AutoStateListener, AutoStatus, ExecutorConfig, LiveWorkerRunner,
-    LlmPlanGenerator, Plan, PlanApprover, WorkerContext, WorkerPoolEntry,
+    LlmPlanGenerator, Plan, PlanApprover, WorkerContext, WorkerPoolEntry, WorkerStatus,
 };
 
 use crate::AppState;
@@ -314,6 +314,44 @@ async fn update_auto_assistant_summary(
         Ok(Err(e)) => log::warn!("[Auto-P7] update_message_llm_content failed row={row_id}: {e}"),
         Err(e) => log::warn!("[Auto-P7] update_message_llm_content join error row={row_id}: {e}"),
     }
+}
+
+/// Build the assistant-message text written when an Auto run is cancelled
+/// mid-flight. Names the phase that was interrupted and lists the summaries
+/// of any workers that completed successfully, so the chat thread keeps
+/// enough context for the next LLM turn (Auto or normal) to pick up.
+///
+/// Format:
+/// ```md
+/// **Auto run stopped during {phase}.**
+///
+/// Completed workers (N):
+/// - **w1** (`claude-haiku-4-5`): first 240 chars of summary…
+/// - **w2** (`claude-opus-4-7`): ...
+/// ```
+///
+/// When no worker completed successfully, only the header line is written.
+fn build_cancelled_summary(run: &AutoRun, phase: &str) -> String {
+    let mut out = format!("**Auto run stopped during {phase}.**\n");
+    let completed: Vec<&agent::auto::WorkerResult> = run
+        .worker_results
+        .iter()
+        .filter(|w| matches!(w.status, WorkerStatus::Ok))
+        .collect();
+    if !completed.is_empty() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "\nCompleted workers ({}):\n", completed.len());
+        for w in &completed {
+            let excerpt: String = w.summary.chars().take(240).collect();
+            let ellipsis = if w.summary.chars().count() > 240 { "…" } else { "" };
+            let _ = write!(
+                out,
+                "- **{}** (`{}`): {}{}\n",
+                w.id, w.model, excerpt, ellipsis
+            );
+        }
+    }
+    out
 }
 
 // ── Tauri commands: settings ─────────────────────────────────────────────
@@ -741,6 +779,58 @@ pub async fn run_auto_turn(
         });
     }
 
+    // ── 2c. Session title (parity with run_agent_turn) ──
+    // First-turn Auto sessions used to keep the 60-char substring fallback
+    // forever because dispatch skipped run_agent_turn's title block. Mirror
+    // the same shape here so the sidebar upgrades to a clean 3–6 word title.
+    {
+        let session_row = {
+            let db = Arc::clone(&agent_state.db);
+            let sid = session_id.clone();
+            tokio::task::spawn_blocking(move || db.get_session(&sid))
+                .await
+                .map_err(|e| format!("join error loading session: {e}"))?
+                .map_err(|e| format!("failed to load session for title check: {e}"))?
+        };
+        let needs_title = session_row
+            .as_ref()
+            .and_then(|s| s.title.as_deref())
+            .unwrap_or("")
+            .is_empty();
+        let fallback: String = message.chars().take(60).collect();
+        {
+            let db = Arc::clone(&agent_state.db);
+            let sid = session_id.clone();
+            let fb = fallback.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = db.set_session_status(&sid, "active");
+                if needs_title && !fb.trim().is_empty() {
+                    let _ = db.set_session_title(&sid, fb.trim());
+                }
+            })
+            .await;
+        }
+        if needs_title && !message.trim().is_empty() {
+            // Title model: user's configured title model if any, else fall
+            // back to the orchestrator's real provider+model. Never the
+            // Auto sentinel — spawn_title_generation needs a real endpoint.
+            let (title_provider, title_model) = super::commands::read_selection(app_state)
+                .title
+                .and_then(|r| super::commands::resolve_ref(app_state, &r))
+                .unwrap_or_else(|| {
+                    (orchestrator_provider.clone(), orchestrator_ref.model.clone())
+                });
+            super::commands::spawn_title_generation(
+                app_handle.clone(),
+                Arc::clone(&agent_state.db),
+                session_id.clone(),
+                message.clone(),
+                title_provider,
+                title_model,
+            );
+        }
+    }
+
     // ── 3. Build event channel + relay ──
     // The relay runs in parallel with the executor; both end-of-Auto event
     // (AutoDone / AutoFailed) and ToolEnd-from-workers are forwarded to the
@@ -887,7 +977,7 @@ pub async fn run_auto_turn(
         let final_run = match &result {
             AutoResult::Done { run, .. }
             | AutoResult::Failed { run, .. }
-            | AutoResult::Cancelled { run } => run.clone(),
+            | AutoResult::Cancelled { run, .. } => run.clone(),
         };
         let _ = tokio::task::spawn_blocking({
             let db_for_run = Arc::clone(&db_for_task);
@@ -902,7 +992,7 @@ pub async fn run_auto_turn(
         let summary_text = match &result {
             AutoResult::Done { summary, .. } => summary.clone(),
             AutoResult::Failed { reason, .. } => format!("Auto run failed: {reason}"),
-            AutoResult::Cancelled { .. } => "Auto run interrupted by user".to_string(),
+            AutoResult::Cancelled { run, phase } => build_cancelled_summary(run, phase),
         };
         update_auto_assistant_summary(
             Arc::clone(&db_for_task),
@@ -1199,7 +1289,7 @@ async fn resume_auto_turn(
         let final_run = match &result {
             AutoResult::Done { run, .. }
             | AutoResult::Failed { run, .. }
-            | AutoResult::Cancelled { run } => run.clone(),
+            | AutoResult::Cancelled { run, .. } => run.clone(),
         };
         let _ = tokio::task::spawn_blocking({
             let db = Arc::clone(&db_for_task);
@@ -1211,7 +1301,7 @@ async fn resume_auto_turn(
         let summary_text = match &result {
             AutoResult::Done { summary, .. } => summary.clone(),
             AutoResult::Failed { reason, .. } => format!("Auto run failed: {reason}"),
-            AutoResult::Cancelled { .. } => "Auto run interrupted by user".to_string(),
+            AutoResult::Cancelled { run, phase } => build_cancelled_summary(run, phase),
         };
         update_auto_assistant_summary(
             Arc::clone(&db_for_task),

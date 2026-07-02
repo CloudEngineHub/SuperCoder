@@ -170,8 +170,11 @@ pub enum AutoResult {
     Done { summary: String, run: AutoRun },
     /// Replan budget exhausted; no silent fallback.
     Failed { reason: String, run: AutoRun },
-    /// User cancelled mid-execution.
-    Cancelled { run: AutoRun },
+    /// User cancelled mid-execution. `phase` captures what was happening
+    /// when cancel fired (e.g. "Planning v2", "Worker w3 (claude-opus-4-7)")
+    /// so the persisted assistant summary can be informative instead of
+    /// generic "interrupted by user".
+    Cancelled { run: AutoRun, phase: String },
 }
 
 /// One entry in the user's curated worker pool (Settings → Auto → Worker pool).
