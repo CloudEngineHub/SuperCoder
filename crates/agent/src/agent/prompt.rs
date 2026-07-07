@@ -45,22 +45,22 @@ pub struct SystemBlock {
 
 /// Build a system prompt for the given mode as an ordered list of blocks.
 ///
-/// Returns 2 or 3 blocks depending on whether a skill registry is provided:
+/// Returns 2-4 blocks depending on which optional sections apply:
 ///   [0] static body — everything except the Environment section, with
-///       `{{working_dir}}` interpolated inline. Marked `cache_control: ephemeral`
-///       (1h TTL) so Anthropic caches this prefix (stable per project).
-///   [1] (optional) Available Skills list — injected when `skills` is Some
-///       and non-empty. Marked `cache_control: ephemeral` (1h TTL) on its own
-///       breakpoint so toggling a skill invalidates only this block's cache,
-///       not block 0's larger prefix. Independence is best-effort: both blocks
-///       expire after 1h.
+///       `{{working_dir}}` interpolated inline.
+///   [1] (optional) Context-engine index guidance — when `context_engine_enabled`.
+///   [2] (optional) Skills + Subagents combined — when either registry has entries.
 ///   [last] environment section — Working directory, branch, project note,
-///       date, OS/arch. NOT cached: `{{date}}` rotates daily, and we don't
+///       date, OS/arch. NOT cached: `{{date}}` rotates daily and we don't
 ///       want a fresh cache write every midnight.
 ///
-/// Across sessions on the same project: block 0 is byte-identical → cache hit.
-/// Across the midnight boundary: block 0 still cache-hits; env block is sent
-/// uncached (~50 tokens, negligible).
+/// Caching: exactly ONE `cache_control: ephemeral` marker is placed on the LAST
+/// cacheable block (i.e. the block immediately before env). Anthropic's prompt
+/// cache extends as a prefix from the start of the request through each
+/// breakpoint, so a single marker at the end of the prefix caches the whole
+/// static+index+skills span as one entry — and keeps the system prompt's
+/// contribution to Anthropic's 4-cache_control limit at exactly 1, leaving
+/// headroom for the conversation-level and tools-level breakpoints.
 pub fn build_system_prompt(
     mode: ToolMode,
     working_dir: &Path,
@@ -95,20 +95,16 @@ pub fn build_system_prompt(
 
     let mut blocks = vec![SystemBlock {
         text: static_body,
-        cache_control: Some(CacheControl::ephemeral()),
+        cache_control: None,
     }];
 
-    // Context-engine index guidance — only when an index is available for this run.
-    // Its own ephemeral breakpoint so toggling the engine invalidates just this block.
     if context_engine_enabled {
         blocks.push(SystemBlock {
             text: INDEX_PROMPT_BLOCK.to_string(),
-            cache_control: Some(CacheControl::ephemeral()),
+            cache_control: None,
         });
     }
 
-    // Skills + Subagents share ONE ephemeral breakpoint. Toggling either
-    // invalidates the combined block once (not twice).
     let skills_entries = skills.map(|r| r.list_for_prompt()).unwrap_or_default();
     let subagents_entries = subagents.map(|r| r.list_for_prompt()).unwrap_or_default();
 
@@ -151,8 +147,16 @@ pub fn build_system_prompt(
         );
         blocks.push(SystemBlock {
             text: combined,
-            cache_control: Some(CacheControl::ephemeral()),
+            cache_control: None,
         });
+    }
+
+    // Single cache breakpoint at the end of the cacheable prefix. Caches the
+    // whole static+index+skills span as one entry regardless of which optional
+    // blocks are present, and leaves room for the conversation + tools markers
+    // within Anthropic's 4-marker cap.
+    if let Some(last) = blocks.last_mut() {
+        last.cache_control = Some(CacheControl::ephemeral());
     }
 
     blocks.push(SystemBlock {
@@ -209,11 +213,63 @@ mod tests {
                 false,
             );
             assert_eq!(blocks.len(), 3, "{:?}: expected 3 blocks with skills", mode);
-            assert!(blocks[0].cache_control.is_some(), "{:?}: static body cached", mode);
-            assert!(blocks[1].cache_control.is_some(), "{:?}: skills cached", mode);
+            // Single cache breakpoint at the end of the cacheable prefix —
+            // static body is part of the same cached span but carries no
+            // marker of its own.
+            assert!(blocks[0].cache_control.is_none(), "{:?}: static body no marker", mode);
+            assert!(blocks[1].cache_control.is_some(), "{:?}: last cacheable block carries marker", mode);
             assert!(blocks[2].cache_control.is_none(), "{:?}: env uncached", mode);
             assert!(blocks[1].text.contains("# Available Skills"));
             assert!(blocks[1].text.contains("hello: A greeting skill."));
+        }
+    }
+
+    // ── Anthropic 4-cache_control invariant: system contributes exactly 1 ──
+
+    #[test]
+    fn test_exactly_one_cache_marker_across_all_configs() {
+        let registry = mk_skill_registry();
+        let empty = SkillRegistry::new(vec![], vec![], vec![], &HashSet::new());
+        // (semantic_on, skills_registry) — env block never carries a marker, so
+        // every config must total exactly one cache_control across all blocks.
+        let cases: &[(bool, Option<&SkillRegistry>)] = &[
+            (false, None),
+            (true, None),
+            (false, Some(&empty)),
+            (true, Some(&empty)),
+            (false, Some(&registry)),
+            (true, Some(&registry)),
+        ];
+        for (semantic_on, skills) in cases {
+            for mode in [ToolMode::Ask, ToolMode::Coding, ToolMode::Plan] {
+                let blocks = build_system_prompt(
+                    mode,
+                    &PathBuf::from("/p"),
+                    Some("main"),
+                    None,
+                    *skills,
+                    None,
+                    *semantic_on,
+                );
+                let markers = blocks.iter().filter(|b| b.cache_control.is_some()).count();
+                assert_eq!(
+                    markers, 1,
+                    "{:?} semantic_on={} skills={}: expected exactly 1 cache_control marker, got {} (blocks={})",
+                    mode,
+                    semantic_on,
+                    skills.is_some(),
+                    markers,
+                    blocks.len(),
+                );
+                // Marker must be on the last *cacheable* block — i.e. the one
+                // immediately before env. Env itself must never be marked.
+                let last_idx = blocks.len() - 1;
+                assert!(blocks[last_idx].cache_control.is_none(), "env block must stay uncached");
+                assert!(
+                    blocks[last_idx - 1].cache_control.is_some(),
+                    "marker must sit on the last cacheable block"
+                );
+            }
         }
     }
 

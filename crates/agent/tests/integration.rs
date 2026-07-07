@@ -1072,3 +1072,570 @@ async fn test_caching_emits_cache_tokens_across_turns() {
         );
     }
 }
+
+/// Surgical, request-shape end-to-end check that the system-prompt
+/// cache_control fix lands correctly on the wire. Complements
+/// `test_caching_emits_cache_tokens_across_turns` (which runs the full agent
+/// loop): this one bypasses the agent and posts a hand-built request, so it
+/// isolates the system-block cache marker logic.
+///
+/// Worst-case shape (semantic search ON + skills present + tools present)
+/// used to emit 5 cache_control markers, exceeding Anthropic's 4-marker cap.
+/// The fix collapses the system contribution to exactly one marker — total 3
+/// on the wire (system + last user message + last tool).
+///
+/// Asserts:
+///   1. The serialized request carries exactly 3 cache_control markers.
+///   2. Anthropic accepts the request (no "too many cache breakpoints" 400).
+///   3. Caching actually works — a second identical request must read from cache.
+#[tokio::test]
+#[ignore = "requires ANTHROPIC_API_KEY"]
+async fn test_system_prompt_cache_breakpoints_under_anthropic_limit() {
+    use agent::agent::prompt::build_system_prompt;
+    use agent::llm::anthropic::build_anthropic_request;
+    use agent::llm::types::{
+        ChatMessage, ContentBlock, FunctionDefinition, MessageContent, ToolDefinition,
+    };
+    use agent::llm::{LlmClientConfig, Provider};
+    use agent::skills::{registry::SkillInput, SkillRegistry};
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    let api_key = api_key();
+
+    // Worst-case shape: context-engine ON + non-empty skill registry.
+    let registry = SkillRegistry::new(
+        vec![],
+        vec![SkillInput {
+            raw: "---\nname: hello\ndescription: greeting skill.\n---\nbody\n".into(),
+            path: PathBuf::from("/hello"),
+        }],
+        vec![],
+        &HashSet::new(),
+    );
+    let system_blocks = build_system_prompt(
+        ToolMode::Coding,
+        &PathBuf::from("/p"),
+        Some("main"),
+        None,
+        Some(&registry),
+        None,
+        /*context_engine_enabled=*/ true,
+    );
+
+    // ChatMessage::system() uses MessageContent::Text and would lose per-block
+    // cache_control. Build the struct manually with Blocks to preserve markers.
+    let system_msg = ChatMessage {
+        role: "system".into(),
+        content: Some(MessageContent::Blocks(
+            system_blocks
+                .into_iter()
+                .map(|b| ContentBlock::Text { text: b.text, cache_control: b.cache_control })
+                .collect(),
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+        thinking: None,
+    };
+    let user_msg = ChatMessage::user("Respond with the single word READY and nothing else.");
+    let messages = vec![system_msg, user_msg];
+
+    // One dummy tool so the tools-level cache marker also fires.
+    let tools = vec![ToolDefinition {
+        type_: "function".into(),
+        function: FunctionDefinition {
+            name: "noop".into(),
+            description: Some("never invoked; present only to exercise tools-level cache".into()),
+            parameters: Some(json!({"type": "object", "properties": {}, "additionalProperties": false})),
+            strict: None,
+        },
+        cache_control: None,
+    }];
+
+    let cfg = LlmClientConfig {
+        provider: Provider::Anthropic,
+        base_url: "https://api.anthropic.com".into(),
+        model: "claude-sonnet-4-6".into(),
+        api_key: api_key.clone(),
+        temperature: Some(0.0),
+        max_completion_tokens: Some(32),
+        extra_headers: vec![],
+        thinking: None,
+        disable_cache_control: false,
+        policy: Default::default(),
+    };
+
+    let mut req = build_anthropic_request(&messages, &tools, &cfg);
+    req.stream = false;
+
+    // (1) Marker count invariant — exactly 3 markers on the wire.
+    let body = serde_json::to_value(&req).expect("serialize request");
+    let markers = count_cache_control_markers(&body);
+    eprintln!("[live] cache_control markers in serialized request: {markers}");
+    assert_eq!(
+        markers, 3,
+        "expected exactly 3 cache_control markers (system+message+tool); got {markers}"
+    );
+
+    let http = reqwest::Client::new();
+
+    // (2) Call 1: cache freshly written OR (on re-run within the 5m TTL window)
+    // read from a prior run. Either is a healthy caching signal.
+    let usage1 = post_anthropic_messages(&http, &api_key, &body).await;
+    eprintln!("[live] call 1 usage: {usage1:?}");
+    assert!(
+        usage1.cache_creation_input_tokens > 0 || usage1.cache_read_input_tokens > 0,
+        "first call must produce cache stats (write or read) (got {usage1:?})"
+    );
+
+    // (3) Call 2: an identical request issued immediately MUST read from cache.
+    let usage2 = post_anthropic_messages(&http, &api_key, &body).await;
+    eprintln!("[live] call 2 usage: {usage2:?}");
+    assert!(
+        usage2.cache_read_input_tokens > 0,
+        "second identical call must read from the cache (got {usage2:?})"
+    );
+}
+
+fn count_cache_control_markers(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mine = matches!(map.get("cache_control"), Some(v) if !v.is_null()) as usize;
+            mine + map.values().map(count_cache_control_markers).sum::<usize>()
+        }
+        serde_json::Value::Array(arr) => arr.iter().map(count_cache_control_markers).sum(),
+        _ => 0,
+    }
+}
+
+#[derive(Debug, Default)]
+#[allow(dead_code)] // fields are read via Debug in eprintln only
+struct AnthropicUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_creation_input_tokens: u32,
+    cache_read_input_tokens: u32,
+}
+
+async fn post_anthropic_messages(
+    http: &reqwest::Client,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> AnthropicUsage {
+    use agent::llm::anthropic::ANTHROPIC_VERSION;
+    let resp = http
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .header("content-type", "application/json")
+        .json(body)
+        .send()
+        .await
+        .expect("HTTP send failed");
+    let status = resp.status();
+    let text = resp.text().await.expect("read body");
+    assert!(
+        status.is_success(),
+        "Anthropic API returned {status}: {}",
+        &text[..text.len().min(1000)]
+    );
+    let v: serde_json::Value = serde_json::from_str(&text).expect("parse response");
+    let u = v.get("usage").cloned().unwrap_or(serde_json::Value::Null);
+    let get = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    AnthropicUsage {
+        input_tokens: get("input_tokens"),
+        output_tokens: get("output_tokens"),
+        cache_creation_input_tokens: get("cache_creation_input_tokens"),
+        cache_read_input_tokens: get("cache_read_input_tokens"),
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Auto mode tests (P1+)
+//
+// PHASE_AUTO_MODE.md. P1 covers the worker runtime in isolation — no
+// orchestrator yet. Hand-crafted WorkerSpec is dispatched through
+// `auto::run_worker` and verified end-to-end.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Run a single worker against a real LLM. Verifies the full P1 surface:
+///   - AutoWorkerStart fires with the spec's identity
+///   - the child AgentLoop runs to completion and uses tools
+///   - AutoWorkerEnd fires with status=Ok and a non-empty summary
+///   - the returned WorkerResult mirrors the events
+#[tokio::test]
+#[ignore = "requires LLM_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY"]
+async fn test_auto_run_worker_single_live() {
+    use agent::auto::{run_worker, SeePrior, SeePriorKeyword, WorkerContext, WorkerSpec, WorkerStatus};
+    use agent::llm::client::LlmPolicy;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    let _ = env_logger::try_init();
+    let tmp = tempdir().unwrap();
+    std::fs::write(tmp.path().join("note.txt"), "the answer is 42\n").unwrap();
+
+    // Reuse the file's existing model/provider resolution so this test runs
+    // against whatever the caller's env is configured for (OpenAI or Anthropic).
+    let template = make_config(&api_key(), tmp.path().to_path_buf());
+
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
+    let mut worker_llm_configs = std::collections::HashMap::new();
+    worker_llm_configs.insert(template.llm.model.clone(), template.llm.clone());
+    let ctx = WorkerContext {
+        session_id: "parent".into(),
+        run_id: "auto-run-1".into(),
+        working_dir: tmp.path().to_path_buf(),
+        event_tx,
+        cancel_token: CancellationToken::new(),
+        worker_llm_configs,
+        retry_config: template.retry_config.clone(),
+        compaction_config: template.compaction_config.clone(),
+        compaction_llm: template.compaction_llm.clone(),
+        max_iterations: 20, // small ceiling — this is a 1-tool task
+        context_engine: None,
+        context_engine_repo_path: None,
+        persister: None,
+        approval_handler: None,
+        checkpoint_dir: None,
+    };
+
+    let spec = WorkerSpec {
+        id: "w1".into(),
+        // Inherit the model the test env picked. The orchestrator (P2) will
+        // pick from the worker pool instead.
+        model: template.llm.model.clone(),
+        prompt: "Read the file note.txt in the working directory and report \
+                 its contents in one short sentence."
+            .into(),
+        see_prior: SeePrior::Keyword(SeePriorKeyword::None),
+    };
+
+    // Collect events in parallel with the worker run.
+    let events_handle = tokio::spawn(async move {
+        let mut out = Vec::new();
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(60), event_rx.recv()).await {
+            let is_terminal = matches!(ev, AgentEvent::AutoWorkerEnd { .. });
+            eprintln!("[auto-evt] {ev:?}");
+            out.push(ev);
+            if is_terminal {
+                break;
+            }
+        }
+        out
+    });
+
+    let result = run_worker(&spec, &[], &ctx).await;
+    let events = events_handle.await.expect("event collector panicked");
+
+    // ── assertions ──
+    assert_eq!(result.id, "w1");
+    assert_eq!(result.model, template.llm.model);
+    assert_eq!(
+        result.status,
+        WorkerStatus::Ok,
+        "worker should finish cleanly; got status={:?}, summary={:?}",
+        result.status,
+        result.summary
+    );
+    assert!(
+        result.summary.contains("42") || result.summary.to_lowercase().contains("answer"),
+        "summary should reference the file content; got: {}",
+        result.summary
+    );
+    assert!(result.tool_count >= 1, "worker should have used at least one tool (read)");
+
+    let start_ok = events.iter().any(|e| matches!(
+        e,
+        AgentEvent::AutoWorkerStart { worker_id, run_id, .. }
+            if worker_id == "w1" && run_id == "auto-run-1"
+    ));
+    let end_ok = events.iter().any(|e| matches!(
+        e,
+        AgentEvent::AutoWorkerEnd { worker_id, run_id, .. }
+            if worker_id == "w1" && run_id == "auto-run-1"
+    ));
+    assert!(start_ok, "AutoWorkerStart event missing");
+    assert!(end_ok, "AutoWorkerEnd event missing");
+
+    // Silence unused-import warnings when this is the only test compiled.
+    let _ = (LlmPolicy::default(),);
+}
+
+/// Live orchestrator call. Verifies the forced-tool-use path end-to-end:
+///   - HTTP body construction with forced tool_choice
+///   - Anthropic (or OpenAI) response parsing
+///   - submit_plan tool input → Plan struct via parse_plan_from_tool_input
+///   - resulting plan picks models from the supplied pool only
+///   - resulting plan has at least one worker with non-empty prompt
+#[tokio::test]
+#[ignore = "requires ANTHROPIC_API_KEY (orchestrator currently defaults to Claude Sonnet 4.6)"]
+async fn test_auto_orchestrator_generates_parseable_plan_live() {
+    use agent::auto::{generate_plan, OrchestratorRequest, WorkerPoolEntry};
+    use agent::llm::{LlmClientConfig, Provider};
+    use agent::llm::client::LlmPolicy;
+
+    let _ = env_logger::try_init();
+    let api_key = api_key();
+
+    let pool = vec![
+        WorkerPoolEntry {
+            provider_id: "anthropic".into(),
+            model: "claude-haiku-4-5".into(),
+            description: "fast + cheap; best for file reads, grep, simple verification".into(),
+        },
+        WorkerPoolEntry {
+            provider_id: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            description: "strong reasoning + coding; best for design, multi-file edits, synthesis".into(),
+        },
+    ];
+
+    let req = OrchestratorRequest {
+        task: "Read the file README.md in the working directory and produce a one-paragraph \
+               summary of what the project does, then list any TODO comments you find anywhere \
+               under src/.",
+        worker_pool: &pool,
+        prior_results: &[],
+        replan_reason: None,
+        plan_version: 1,
+    };
+
+    let orchestrator_llm = LlmClientConfig {
+        provider: Provider::Anthropic,
+        base_url: "https://api.anthropic.com".into(),
+        model: "claude-sonnet-4-6".into(),
+        api_key,
+        temperature: Some(0.0),
+        max_completion_tokens: Some(4096),
+        extra_headers: vec![],
+        thinking: None,
+        disable_cache_control: true,
+        policy: LlmPolicy::default(),
+    };
+
+    let plan = generate_plan(&orchestrator_llm, &req, None)
+        .await
+        .expect("orchestrator should produce a parseable plan");
+
+    eprintln!("[live] plan v{}: {}", plan.version, plan.reasoning);
+    for w in &plan.workers {
+        eprintln!(
+            "[live]   {} ({}): see_prior={:?}, prompt={:?}",
+            w.id,
+            w.model,
+            w.see_prior,
+            &w.prompt[..w.prompt.len().min(80)]
+        );
+    }
+
+    assert_eq!(plan.version, 1);
+    assert!(!plan.reasoning.is_empty(), "reasoning must be non-empty");
+    assert!(!plan.workers.is_empty(), "plan must contain at least one worker");
+    assert!(
+        plan.workers.len() <= 10,
+        "plan exceeded the system-prompt's 10-worker hard cap: {} workers",
+        plan.workers.len()
+    );
+
+    let pool_models: std::collections::HashSet<&str> =
+        pool.iter().map(|e| e.model.as_str()).collect();
+    for w in &plan.workers {
+        assert!(
+            pool_models.contains(w.model.as_str()),
+            "worker {} picked model `{}` not in pool {:?}",
+            w.id,
+            w.model,
+            pool_models
+        );
+        assert!(!w.prompt.is_empty(), "worker {} has empty prompt", w.id);
+        assert!(w.id.starts_with('w'), "worker id should be wN, got `{}`", w.id);
+    }
+}
+
+/// Full end-to-end Auto mode against a real LLM stack: real orchestrator,
+/// real `LiveWorkerRunner`, real `LlmPlanGenerator`, sequenced by
+/// `executor::run`. This is the test that P3's mocked unit tests cannot
+/// replace — it proves the components compose correctly under real cancel
+/// tokens, async boundaries, and channel back-pressure.
+///
+/// Task is intentionally small (create a file with specific contents) so the
+/// orchestrator likely emits a single-worker plan, keeping the test fast and
+/// cheap (~$0.02–0.05 per run on Sonnet 4.6).
+#[tokio::test]
+#[ignore = "requires ANTHROPIC_API_KEY (Auto orchestrator + workers both Anthropic)"]
+async fn test_auto_executor_end_to_end_live() {
+    use agent::auto::{
+        run_auto, AutoApprove, AutoResult, AutoStatus, ExecutorConfig, LiveWorkerRunner,
+        LlmPlanGenerator, WorkerContext, WorkerPoolEntry,
+    };
+    use agent::llm::client::LlmPolicy;
+    use agent::llm::{LlmClientConfig, Provider};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    let _ = env_logger::try_init();
+    let tmp = tempdir().unwrap();
+    let working_dir = tmp.path().to_path_buf();
+    let api_key = api_key();
+
+    // Worker pool: two real Anthropic models. Description tells the
+    // orchestrator how to pick.
+    let pool = vec![
+        WorkerPoolEntry {
+            provider_id: "anthropic".into(),
+            model: "claude-haiku-4-5".into(),
+            description: "fast + cheap; best for simple file ops, reads, single-shot writes".into(),
+        },
+        WorkerPoolEntry {
+            provider_id: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            description: "stronger reasoning + multi-step coding; best for design and complex edits".into(),
+        },
+    ];
+
+    let orchestrator_llm = LlmClientConfig {
+        provider: Provider::Anthropic,
+        base_url: "https://api.anthropic.com".into(),
+        model: "claude-sonnet-4-6".into(),
+        api_key: api_key.clone(),
+        temperature: Some(0.0),
+        max_completion_tokens: Some(4096),
+        extra_headers: vec![],
+        thinking: None,
+        disable_cache_control: true,
+        policy: LlmPolicy::default(),
+    };
+
+    // Per-worker LLM configs keyed by model name. Both pool models share the
+    // same Anthropic provider for this end-to-end test.
+    let worker_llm_configs: std::collections::HashMap<String, LlmClientConfig> = pool
+        .iter()
+        .map(|e| {
+            (
+                e.model.clone(),
+                LlmClientConfig {
+                    provider: Provider::Anthropic,
+                    base_url: "https://api.anthropic.com".into(),
+                    model: e.model.clone(),
+                    api_key: api_key.clone(),
+                    temperature: Some(0.0),
+                    max_completion_tokens: Some(2048),
+                    extra_headers: vec![],
+                    thinking: None,
+                    disable_cache_control: true,
+                    policy: LlmPolicy::default(),
+                },
+            )
+        })
+        .collect();
+
+    let cancel = CancellationToken::new();
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
+
+    let auto_run_id = "auto-run-e2e".to_string();
+    let session_id = "sess-e2e".to_string();
+
+    let worker_ctx = WorkerContext {
+        session_id: session_id.clone(),
+        run_id: auto_run_id.clone(),
+        working_dir: working_dir.clone(),
+        event_tx: event_tx.clone(),
+        cancel_token: cancel.clone(),
+        worker_llm_configs,
+        retry_config: RetryConfig::default(),
+        compaction_config: Default::default(),
+        compaction_llm: None,
+        max_iterations: 20,
+        context_engine: None,
+        context_engine_repo_path: None,
+        persister: None,
+        approval_handler: None,
+        checkpoint_dir: None,
+    };
+
+    let plan_gen = Arc::new(LlmPlanGenerator { llm: orchestrator_llm });
+    let runner = Arc::new(LiveWorkerRunner { ctx: worker_ctx });
+    let approver = Arc::new(AutoApprove);
+
+    let config = ExecutorConfig {
+        task: "Create a file named `result.txt` in the working directory whose \
+               sole contents are the exact string `hello from auto mode` followed \
+               by a single trailing newline. Do not create any other files."
+            .into(),
+        auto_run_id: auto_run_id.clone(),
+        session_id: session_id.clone(),
+        worker_pool: pool,
+        replan_budget: 1,
+        resume_from: None,
+        start_at_worker_id: None,
+        initial_replan_reason: None,
+    };
+
+    // Collect events on a side task so they don't fill the channel buffer.
+    let collected_events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+    let collector = {
+        let collected = Arc::clone(&collected_events);
+        tokio::spawn(async move {
+            while let Ok(Some(ev)) =
+                tokio::time::timeout(Duration::from_secs(120), event_rx.recv()).await
+            {
+                let is_terminal = matches!(
+                    ev,
+                    AgentEvent::AutoDone { .. } | AgentEvent::AutoFailed { .. }
+                );
+                eprintln!("[auto-e2e] {ev:?}");
+                collected.lock().unwrap().push(ev);
+                if is_terminal {
+                    break;
+                }
+            }
+        })
+    };
+
+    let result = run_auto(config, event_tx, plan_gen, runner, approver, cancel, None).await;
+    // Wait for the collector to drain the terminal event.
+    let _ = tokio::time::timeout(Duration::from_secs(5), collector).await;
+
+    // ── Result-level assertions ──
+    match &result {
+        AutoResult::Done { run, summary } => {
+            eprintln!("[auto-e2e] AutoDone summary: {summary}");
+            assert_eq!(run.status, AutoStatus::Done);
+            assert!(!run.plan_versions.is_empty(), "plan must have been generated");
+            assert!(!run.worker_results.is_empty(), "at least one worker must have run");
+            assert!(
+                run.replans_used <= 1,
+                "should not have exhausted replan budget on a simple task; used={}",
+                run.replans_used
+            );
+        }
+        other => panic!(
+            "expected AutoResult::Done for a trivial file-write task, got: {other:?}"
+        ),
+    }
+
+    // ── File-side assertion: the worker actually wrote the file ──
+    let written = std::fs::read_to_string(working_dir.join("result.txt"))
+        .expect("result.txt should exist after Auto task completes");
+    assert_eq!(
+        written.trim_end_matches('\n'),
+        "hello from auto mode",
+        "file contents mismatch; got: {written:?}"
+    );
+
+    // ── Event-stream assertions: the whole bracket fired in order ──
+    let events = collected_events.lock().unwrap().clone();
+    let has = |needle: &str| events.iter().any(|e| format!("{e:?}").contains(needle));
+    assert!(has("AutoPlanning"), "missing AutoPlanning event");
+    assert!(has("AutoPlan {"), "missing AutoPlan event");
+    assert!(has("AutoAwaitingApproval"), "missing AutoAwaitingApproval event");
+    assert!(has("AutoWorkerStart"), "missing AutoWorkerStart event");
+    assert!(has("AutoWorkerEnd"), "missing AutoWorkerEnd event");
+    assert!(has("AutoDone"), "missing AutoDone event");
+    assert!(!has("AutoFailed"), "should not have failed on a trivial task");
+}

@@ -26,6 +26,7 @@ export function displayToAgentMessage(m: AgentDisplayMessage): AgentMessage {
     artifacts: [],
     created_at: m.created_at,
     thinking,
+    auto_run_id: m.auto_run_id,
   };
 }
 

@@ -58,7 +58,9 @@ const LANG_ALIAS: Record<string, string> = {
 function highlight(code: string, lang?: string): ReactNode {
   const name = lang ? (LANG_ALIAS[lang] ?? lang) : undefined;
   if (name && refractor.registered(name)) {
-    const tree = refractor.highlight(code, name) as unknown as JsxRuntimeTree;
+    // refractor v3 returns Array<Node>; hast-util-to-jsx-runtime needs a Root.
+    const children = refractor.highlight(code, name) as unknown as unknown[];
+    const tree = { type: 'root', children } as unknown as JsxRuntimeTree;
     return toJsxRuntime(tree, { Fragment, jsx, jsxs });
   }
   return code;

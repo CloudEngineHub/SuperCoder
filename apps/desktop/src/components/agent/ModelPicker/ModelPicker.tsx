@@ -1,10 +1,15 @@
-import { useEffect, useMemo, useCallback } from "react";
-import { Bot, ChevronDown } from "lucide-react";
+import { useEffect, useMemo, useCallback, useState } from "react";
+import { Bot, ChevronDown, Sparkles } from "lucide-react";
 import { useAppStore } from "@/store";
+import { agentTauriService } from "@/services/agentTauriService";
 import ActionChip from "@/components/common/ActionChip/ActionChip";
 import CustomDropdown from "@/components/common/CustomDropdown/CustomDropdown";
 import type { CustomDropdownItem } from "@/components/common/CustomDropdown/types";
-import type { ProviderConfig } from "@/types/agent";
+import {
+  AUTO_SENTINEL_MODEL,
+  AUTO_SENTINEL_PROVIDER_ID,
+  type ProviderConfig,
+} from "@/types/agent";
 
 /** Display name for a provider group: kind label, or the host for OpenAI-compatible. */
 function providerName(p: ProviderConfig): string {
@@ -35,9 +40,23 @@ export default function ModelPicker() {
     activeThreadId ? s.sessions.find((x) => x.id === activeThreadId) : undefined,
   );
 
+  // Auto-mode availability is a Settings flag, not derived from providers.
+  // Re-fetched whenever the dropdown opens so a toggle change in Settings
+  // shows up without a full reload.
+  const [autoEnabled, setAutoEnabled] = useState(false);
+
   useEffect(() => {
     if (!providersLoaded) loadProviders();
   }, [providersLoaded, loadProviders]);
+
+  // Initial fetch of auto_enabled. Errors are silent (the picker just won't
+  // show Auto) — Settings is the place to surface them.
+  useEffect(() => {
+    agentTauriService
+      .getAutoSettings()
+      .then((s) => setAutoEnabled(s.enabled))
+      .catch(() => setAutoEnabled(false));
+  }, []);
 
   // When a session opens, align the in-memory active model + vision gating to it.
   useEffect(() => {
@@ -53,11 +72,37 @@ export default function ModelPicker() {
   );
 
   // Flatten providers → models as grouped dropdown items (header + model rows).
+  // When Auto is enabled in Settings AND the open session is in Code mode,
+  // a magic ✨ entry sits at the top with a divider before the first regular
+  // provider. Auto is scoped to Code because the orchestrator-of-workers
+  // pattern is code-execution-oriented; Plan/Ask surfaces stay picker-only.
+  const showAuto = autoEnabled && openSession?.mode === "coding";
   const dropdownItems: CustomDropdownItem[] = useMemo(() => {
     const items: CustomDropdownItem[] = [];
+    if (showAuto) {
+      items.push({
+        key: `${AUTO_SENTINEL_PROVIDER_ID}::${AUTO_SENTINEL_MODEL}`,
+        label: "Auto",
+        // Sparkles sized + colored to match the Bot icon used by regular
+        // models (text-gray-500, w-4 h-4) — Auto is a peer of the other
+        // models in the picker, not a banner. The chip prefix when Auto is
+        // active uses the same muted color for consistency.
+        icon: <Sparkles className="w-4 h-4 text-gray-500" />,
+        onClick: () =>
+          handleSelect(AUTO_SENTINEL_PROVIDER_ID, AUTO_SENTINEL_MODEL),
+      });
+    }
+    let firstProviderHeader = true;
     for (const p of providers) {
       if (p.models.length === 0) continue;
-      items.push({ key: `hdr-${p.id}`, label: providerName(p), disabled: true });
+      items.push({
+        key: `hdr-${p.id}`,
+        label: providerName(p),
+        disabled: true,
+        // Visual break between the Auto entry and the regular providers.
+        dividerBefore: showAuto && firstProviderHeader,
+      });
+      firstProviderHeader = false;
       for (const m of p.models) {
         items.push({
           key: `${p.id}::${m}`,
@@ -68,10 +113,16 @@ export default function ModelPicker() {
       }
     }
     return items;
-  }, [providers, handleSelect]);
+  }, [showAuto, providers, handleSelect]);
 
-  // Show the open session's model when one is open; otherwise the global default.
-  const displayLabel = openSession?.model ?? selection.active?.model ?? "Select model";
+  // Active model resolution. Auto sentinel is shown as "✨ Auto" (we never
+  // want the literal sentinel string to leak into the chip).
+  const activeProviderId = openSession?.providerId ?? selection.active?.providerId;
+  const activeModel = openSession?.model ?? selection.active?.model;
+  const isAuto =
+    activeProviderId === AUTO_SENTINEL_PROVIDER_ID &&
+    activeModel === AUTO_SENTINEL_MODEL;
+  const displayLabel = isAuto ? "Auto" : activeModel ?? "Select model";
 
   return (
     <CustomDropdown
@@ -81,7 +132,13 @@ export default function ModelPicker() {
       trigger={
         <ActionChip
           label={displayLabel}
-          prefix={<Bot className="w-4 h-4 text-gray-500" />}
+          prefix={
+            isAuto ? (
+              <Sparkles className="w-4 h-4 text-gray-500" />
+            ) : (
+              <Bot className="w-4 h-4 text-gray-500" />
+            )
+          }
           suffix={<ChevronDown className="w-4 h-4 text-gray-500" />}
         />
       }

@@ -511,9 +511,23 @@ impl EngineController {
     }
 
     /// Stop containers, keep volumes (fast restart). Cancels any in-flight start.
+    ///
+    /// Early-returns when the controller has no live state worth tearing down:
+    /// the user kept the engine disabled this session (status still `Stopped`)
+    /// or Docker is unreachable (`DockerMissing`). Without this guard, quitting
+    /// the app with semantic search off would shell out to `docker compose
+    /// stop` against a project we never created; a slow/unresponsive Docker
+    /// daemon then wedges the quit handler indefinitely (no timeout on the
+    /// child process).
     pub async fn stop(&self) -> Result<(), String> {
         if let Some(t) = self.cancel.lock().take() {
             t.cancel();
+        }
+        if matches!(
+            *self.status.lock(),
+            EngineStatus::Stopped | EngineStatus::DockerMissing { .. }
+        ) {
+            return Ok(());
         }
         // Short stop timeout: the worker has no SIGTERM handler and would
         // otherwise hold the default ~10s grace before being killed, making quit

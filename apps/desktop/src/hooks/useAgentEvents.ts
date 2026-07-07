@@ -4,7 +4,20 @@ import { useAppStore } from "@/store";
 import { createInitialStreamingState } from "@/store/agentSlice";
 import { agentTauriService } from "@/services/agentTauriService";
 import { parseThinkingMarkers, buildAgentMessage, buildThinkingMeta, displayToAgentMessage } from "@/utils/agentMessageAdapter";
-import type { EngineStatus } from "@/types/agent";
+import type {
+  AutoAwaitingApprovalEvent,
+  AutoAwaitingFailureDecisionEvent,
+  AutoDoneEvent,
+  AutoFailedEvent,
+  AutoPlanEvent,
+  AutoPlanningEvent,
+  AutoReplanEvent,
+  AutoWorkerEndEvent,
+  AutoWorkerStartEvent,
+  AutoWorkerToolEndEvent,
+  AutoWorkerToolStartEvent,
+  EngineStatus,
+} from "@/types/agent";
 import type {
   ApprovalNeededPayload,
   TextDeltaPayload,
@@ -362,6 +375,171 @@ export function useAgentEvents() {
     listeners.push(
       listen<string>("engine:progress", (event) => {
         useAppStore.getState().setEngineProgress(event.payload);
+      }),
+    );
+
+    // ── agent:auto_* (Auto-mode orchestrator + worker lifecycle, P4/P6/P7) ─
+    // Eight events form one task's lifecycle: planning → plan → awaiting →
+    // worker_start/end (×N) → optional replan → done/failed. Keyed by run_id
+    // in the slice (one entry per Auto turn). thread_id is only used for
+    // session-scoped side-effects (Thinking placeholder, approvals).
+    listeners.push(
+      listen<AutoPlanningEvent>("agent:auto_planning", (event) => {
+        const { thread_id, run_id } = event.payload;
+        console.info("[Auto-P7] evt auto_planning session=%s run=%s", thread_id, run_id);
+        const store = useAppStore.getState();
+        store.setAutoPlanning(thread_id, run_id);
+        // Auto turns persist their user + placeholder assistant rows in
+        // run_auto_turn BEFORE emitting auto_planning, so refreshing the
+        // thread now picks up real DB ids — replaces the optimistic user
+        // bubble and adds the AutoRunPanel anchor inline at the right
+        // position. Same pattern as agent:checkpoint_restored.
+        agentTauriService
+          .getMessages(thread_id)
+          .then((msgs) => {
+            const autoRows = msgs.filter((m) => m.auto_run_id);
+            console.info("[Auto-P7] refreshed messages count=%d auto_anchors=%d",
+              msgs.length, autoRows.length);
+            useAppStore
+              .getState()
+              .replaceThreadMessages(thread_id, msgs.map(displayToAgentMessage));
+          })
+          .catch((e) => console.warn("[Auto-P7] refresh failed:", e));
+      }),
+    );
+    listeners.push(
+      listen<AutoPlanEvent>("agent:auto_plan", (event) => {
+        const { run_id, version, reasoning, plan } = event.payload;
+        useAppStore.getState().setAutoPlan(run_id, version, reasoning, plan);
+      }),
+    );
+    listeners.push(
+      listen<AutoAwaitingApprovalEvent>(
+        "agent:auto_awaiting_approval",
+        (event) => {
+          const { run_id } = event.payload;
+          useAppStore.getState().setAutoAwaitingApproval(run_id);
+        },
+      ),
+    );
+    listeners.push(
+      listen<AutoWorkerStartEvent>("agent:auto_worker_start", (event) => {
+        const { run_id, worker_id, model, prompt } = event.payload;
+        useAppStore
+          .getState()
+          .setAutoWorkerStart(run_id, worker_id, model, prompt);
+      }),
+    );
+    listeners.push(
+      listen<AutoWorkerEndEvent>("agent:auto_worker_end", (event) => {
+        const {
+          run_id,
+          worker_id,
+          summary,
+          cost_cents,
+          tool_count,
+          status,
+        } = event.payload;
+        useAppStore.getState().appendAutoWorkerEnd(run_id, {
+          id: worker_id,
+          model: "", // model is in setAutoWorkerStart; not duplicated on end
+          prompt: "",
+          summary,
+          cost_cents,
+          tool_count,
+          status,
+        });
+      }),
+    );
+    listeners.push(
+      listen<AutoWorkerToolStartEvent>(
+        "agent:auto_worker_tool_start",
+        (event) => {
+          const { run_id, worker_id, tool_call_id, tool_name, args_summary } =
+            event.payload;
+          useAppStore
+            .getState()
+            .appendAutoWorkerToolStart(
+              run_id,
+              worker_id,
+              tool_call_id,
+              tool_name,
+              args_summary,
+            );
+        },
+      ),
+    );
+    listeners.push(
+      listen<AutoWorkerToolEndEvent>(
+        "agent:auto_worker_tool_end",
+        (event) => {
+          const { run_id, worker_id, tool_call_id, success, summary } =
+            event.payload;
+          useAppStore
+            .getState()
+            .patchAutoWorkerToolEnd(
+              run_id,
+              worker_id,
+              tool_call_id,
+              success,
+              summary,
+            );
+        },
+      ),
+    );
+    listeners.push(
+      listen<AutoReplanEvent>("agent:auto_replan", (event) => {
+        const { run_id, reason } = event.payload;
+        useAppStore.getState().setAutoReplan(run_id, reason);
+      }),
+    );
+    listeners.push(
+      listen<AutoFailedEvent>("agent:auto_failed", (event) => {
+        const { thread_id, run_id, reason, last_worker_output } = event.payload;
+        console.info("[Auto-P7] evt auto_failed session=%s run=%s reason=%s", thread_id, run_id, reason);
+        const store = useAppStore.getState();
+        store.setAutoFailed(run_id, reason, last_worker_output);
+        // Terminal: stop the "Thinking…" placeholder + tear down any tool
+        // activity state that was set when the turn started. Mirrors what
+        // the regular `agent:done` handler does for normal sessions.
+        store.softClearAgentStreaming(thread_id);
+        clearApprovalsForSession(thread_id);
+      }),
+    );
+    listeners.push(
+      listen<AutoAwaitingFailureDecisionEvent>(
+        "agent:auto_awaiting_failure_decision",
+        (event) => {
+          const { thread_id, run_id, failure } = event.payload;
+          console.info(
+            "[Auto-P7] evt auto_awaiting_failure_decision session=%s run=%s worker=%s",
+            thread_id, run_id, failure.worker_id,
+          );
+          const store = useAppStore.getState();
+          // Failure context is inline on the event, so we transition
+          // straight to the amber banner without a snapshot refetch. This
+          // closes the race where the DB write for `pending_failure`
+          // (fire-and-forget via mpsc + spawn_blocking) lost to the
+          // frontend's read, leaving the panel stuck on the red terminal
+          // banner with no recovery controls.
+          store.setAutoAwaitingFailureDecision(run_id, failure);
+          // Terminal for the executor task — mirror the housekeeping the
+          // regular terminal handlers do so the "Thinking…" placeholder +
+          // any lingering approvals get cleared.
+          store.softClearAgentStreaming(thread_id);
+          clearApprovalsForSession(thread_id);
+        },
+      ),
+    );
+    listeners.push(
+      listen<AutoDoneEvent>("agent:auto_done", (event) => {
+        const { thread_id, run_id, summary, total_cost_cents } = event.payload;
+        console.info("[Auto-P7] evt auto_done session=%s run=%s cost=%d summary_len=%d",
+          thread_id, run_id, total_cost_cents, summary?.length ?? 0);
+        const store = useAppStore.getState();
+        store.setAutoDone(run_id, summary, total_cost_cents);
+        store.softClearAgentStreaming(thread_id);
+        clearApprovalsForSession(thread_id);
       }),
     );
 
